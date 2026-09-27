@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -135,9 +136,78 @@ class ServerImprovementsTests(unittest.TestCase):
             payload = server.resolve_and_play("Silencio", "Living", server.LIBRARY, mode="track", artist="U2")
             self.assertTrue(payload["ok"])
             mock_resolve.assert_called_once_with(
-                "Silencio", "Living", None, False, None, False, artist="U2"
+                "Silencio", "Living", None, False, None, False, artist="U2", album=None, live=None
             )
 
+    def test_resolve_and_play_passes_album_and_live(self):
+        server = load_server()
+        with mock.patch.object(server, "resolve") as mock_resolve, mock.patch.object(server, "play_resolution") as mock_play:
+            from music_resolver import Resolution
+            mock_resolve.return_value = Resolution("youtube", "url", "https://youtube.com/watch?v=123", "Paint It Black", "The Rolling Stones")
+            mock_play.return_value = {"ok": True}
+            payload = server.resolve_and_play("Paint It Black", "Living", server.LIBRARY, mode="track", album="Aftermath", live=False)
+            self.assertTrue(payload["ok"])
+            mock_resolve.assert_called_once_with(
+                "Paint It Black", "Living", None, False, None, False, artist=None, album="Aftermath", live=False
+            )
+
+    def test_search_tracks_samba_and_youtube(self):
+        server = load_server()
+        fake_tracks = [
+            {"title": "Paint It, Black", "artist": "The Rolling Stones", "album": "Aftermath", "uri": "x-file-cifs://...", "is_live": False}
+        ]
+        with mock.patch.object(server.LIBRARY, "search_many", return_value=fake_tracks):
+            res = server.search_tracks("Paint It Black", album="Aftermath", live=False, provider="samba", limit=5)
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0]["title"], "Paint It, Black")
+            self.assertEqual(res[0]["provider"], "samba")
+            self.assertIs(res[0]["is_live"], False)
+
+        with mock.patch.object(server, "search_youtube_many", return_value=[{"title": "Paint It, Black", "artist": "The Rolling Stones", "url": "https://youtube.com/watch?v=123"}]):
+            res_yt = server.search_tracks("Paint It Black", provider="youtube", limit=5)
+            self.assertEqual(len(res_yt), 1)
+            self.assertEqual(res_yt[0]["provider"], "youtube")
+
+    def test_search_http_handler_get_and_post(self):
+        server = load_server()
+        class DummySearchHandler(server.Handler):
+            def __init__(self, path, command="GET", body=b""):
+                self.path = path
+                self.command = command
+                self.headers = {"Content-Length": str(len(body))}
+                self.rfile = io.BytesIO(body)
+                self.wfile = io.BytesIO()
+                self.sent_status = None
+                self.sent_headers = {}
+
+            def send_response(self, status, message=None):
+                self.sent_status = status
+
+            def send_header(self, key, value):
+                self.sent_headers[key] = value
+
+            def end_headers(self):
+                pass
+
+            def log_message(self, format, *args):
+                pass
+
+        with mock.patch.object(server, "search_tracks", return_value=[{"title": "Paint It, Black", "provider": "samba"}]):
+            # GET /search?q=Paint+It+Black
+            handler = DummySearchHandler("/search?q=Paint+It+Black")
+            handler.do_GET()
+            self.assertEqual(handler.sent_status, 200)
+            data = json.loads(handler.wfile.getvalue().decode())
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["count"], 1)
+
+            # POST /search
+            body = json.dumps({"query": "Paint It Black", "live": False}).encode()
+            post_handler = DummySearchHandler("/search", command="POST", body=body)
+            post_handler.do_POST()
+            self.assertEqual(post_handler.sent_status, 200)
+            post_data = json.loads(post_handler.wfile.getvalue().decode())
+            self.assertTrue(post_data["ok"])
 
     def test_centralized_version(self):
         import _version

@@ -81,6 +81,7 @@ Cuando se envía una petición a `/resolve` o `/resolve-and-play`:
 El sistema está optimizado para procesar consultas en español:
 * **Tildes y Diacríticos**: Búsqueda 100% tolerante. Buscar `"cancion"` encuentra `"Canción"`, y buscar `"corazón"` encuentra `"corazon"`.
 * **Palabras de Invocación / Carrier Words**: Filtra automáticamente palabras habituales de comandos de voz (*"canción"*, *"cancion"*, *"disco"*, *"album"*, *"tema"*, *"pon"*, *"reproduce"*, *"musica"*) cuando acompañan a la consulta.
+* **Detección Natural de Versión Estudio vs. En Vivo**: Interpreta frases conversacionales como *"Paint It, Black de estudio"*, *"versión de estudio"*, *"en vivo"*, *"en directo"* o *"live"*. Si el usuario pide versión de estudio y en la biblioteca local solo existe una versión en vivo (ej. *Flashpoint* de The Rolling Stones), el sistema evita esa pista y recurre automáticamente a la versión de estudio de YouTube Music.
 * **Detección Natural de Género y Década**: Interpreta frases conversacionales como *"canciones de rock de los 80"*, *"música pop 90s"*, *"temas de los 70"*, *"rock 80s"*, extrayendo de forma transparente el género y el rango temporal sin necesidad de formatear parámetros especiales.
 * **Preposición `" de "`**: Maneja de forma inteligente consultas como `"Canciones de amor"` frente a `"Thriller de Michael Jackson"`.
 * **Prefijos de YouTube Music en Español**: Soporta `"Álbum - "`, `"Sencillo - "`, `"EP - "` y sus versiones en inglés.
@@ -111,7 +112,7 @@ Estado del servicio, versión y configuración de cron.
 {
   "ok": true,
   "service": "sonos-api",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "scheduled_reindex": "0 4 * * *",
   "timezone": "America/Santiago"
 }
@@ -131,6 +132,58 @@ Cantidad de canciones locales indexadas y marca de tiempo de la última sincroni
     "sonos_total": 8420,
     "room": "Living"
   }
+}
+```
+
+#### `GET /search` / `POST /search`
+Búsqueda y exploración de candidatos de canciones (modo dry-run sin reproducir). Devuelve opciones coincidentes en la biblioteca local Samba y/o YouTube con metadatos (`title`, `artist`, `album`, `year`, `is_live`, `provider`, `target`). Permite explorar y seleccionar la versión deseada (estudio vs en vivo, álbum original vs directo).
+
+* **Parámetros (`query params` en GET o `JSON body` en POST):**
+  * `query` o `q` (`string`, obligatorio): Título o término de búsqueda.
+  * `artist` (`string`, opcional): Filtro de artista.
+  * `album` (`string`, opcional): Filtro de álbum específico.
+  * `live` (`bool`, opcional): `false` para versión de estudio, `true` para versión en vivo.
+  * `provider` (`string`, opcional): `"auto"` (Samba + YouTube), `"samba"` (solo local) o `"youtube"`.
+  * `limit` (`int`, opcional): Máximo de resultados a devolver (1 a 50, por defecto 5).
+
+```json
+// Petición POST /search
+{
+  "query": "Paint It Black",
+  "artist": "The Rolling Stones",
+  "live": false,
+  "limit": 5
+}
+
+// Respuesta (HTTP 200)
+{
+  "ok": true,
+  "query": "Paint It Black",
+  "count": 2,
+  "tracks": [
+    {
+      "title": "Paint It, Black",
+      "artist": "The Rolling Stones",
+      "album": "Aftermath",
+      "genre": "Rock",
+      "year": 1966,
+      "provider": "samba",
+      "kind": "uri",
+      "target": "x-file-cifs://...",
+      "is_live": false
+    },
+    {
+      "title": "The Rolling Stones - Paint It, Black (Official Lyric Video)",
+      "artist": "The Rolling Stones",
+      "album": "",
+      "genre": "",
+      "year": null,
+      "provider": "youtube",
+      "kind": "url",
+      "target": "https://www.youtube.com/watch?v=O4irXQhgMqg",
+      "is_live": false
+    }
+  ]
 }
 ```
 
@@ -227,6 +280,8 @@ O especificando un altavoz concreto:
 | `decade` | `int` | No | `null` | Década o año de lanzamiento (ej. `1980` u `80`). Abarca el rango decenal (ej. 1980 a 1989). |
 | `provider` | `string` | No | `null` | Proveedor: `null` (auto: Samba -> YouTube), `"samba"`, `"youtube"` o `"youtube_music"`. |
 | `artist` | `string` | No | `""` | Filtro opcional de artista para precisar la búsqueda. |
+| `album` | `string` | No | `""` | Filtro opcional de álbum para forzar la versión de un disco específico (ej. `"Aftermath"`). |
+| `live` | `bool` | No | `null` | `false` para forzar versión de estudio (excluye o penaliza álbumes en vivo como *Flashpoint*), `true` para versión en vivo. Si es `null`, se autodetecta desde `query`. |
 | `shuffle` | `bool` | No | `true` | En modo `"artist"` o `"genre"`, si es `true` mezcla las pistas aleatoriamente (tipo radio). Si es `false`, mantiene el orden cronológico / discográfico. |
 | `limit` | `int` | No | `10` | Límite de resultados en modo `"list"`, `"artist"` o `"genre"` (1 a 50). |
 | `bypass_cache` | `bool` | No | `false` | Si es `true`, ignora la caché SQLite y fuerza una nueva resolución. |
@@ -386,7 +441,8 @@ Cualquier modelo de IA conectado tendrá acceso directo a las siguientes funcion
 
 | Herramienta | Parámetros | Descripción |
 | :--- | :--- | :--- |
-| `sonos_play_music` | `query` *(opcional si se indica `genre`)*, `room`, `provider` (`"auto"`, `"samba"`, `"youtube"`), `mode` (`"track"`, `"album"`, `"artist"`, `"genre"`, `"list"`), `genre`, `decade`, `artist`, `shuffle`, `limit`, `bypass_cache` | Resuelve y reproduce música en Sonos desde Samba o YouTube Music. Soporta búsquedas por canción, disco, discografía o género/década (ej. *"rock de los 80"* o parámetros explícitos `genre="Rock"` y `decade=1980`). Con `provider="samba"` fuerza solo música local sin fallback a YouTube, y con `provider="youtube"` busca directamente en YouTube. Si no se indica `room`, autodescubre el altavoz activo. **Devuelve metadatos enriquecidos con `image_url` listo para previsualización o envío en Telegram**. |
+| `sonos_play_music` | `query` *(opcional si se indica `genre`)*, `room`, `provider` (`"auto"`, `"samba"`, `"youtube"`), `mode` (`"track"`, `"album"`, `"artist"`, `"genre"`, `"list"`), `genre`, `decade`, `artist`, `album`, `live`, `shuffle`, `limit`, `bypass_cache` | Resuelve y reproduce música en Sonos desde Samba o YouTube Music. Soporta búsquedas por canción, disco, discografía o género/década (ej. *"rock de los 80"* o parámetros explícitos `genre="Rock"` y `decade=1980`). Con `album` precisa el disco específico, y con `live=false` o `live=true` fuerza versión de estudio o en vivo (evitando álbumes en vivo como *Flashpoint* si se pide estudio). Con `provider="samba"` fuerza solo música local sin fallback a YouTube, y con `provider="youtube"` busca directamente en YouTube. Si no se indica `room`, autodescubre el altavoz activo. **Devuelve metadatos enriquecidos con `image_url` listo para previsualización o envío en Telegram**. |
+| `sonos_search_music` | `query` *(obligatorio)*, `artist`, `album`, `live`, `provider` (`"auto"`, `"samba"`, `"youtube"`), `limit` | Busca y devuelve una lista de canciones coincidentes con metadatos (`title`, `artist`, `album`, `year`, `provider`, `is_live`) **sin reproducir**. Permite a la IA inspeccionar candidatos y dar a elegir al usuario entre diferentes versiones (estudio vs en vivo, álbumes distintos). |
 | `sonos_pause` | `room` *(opcional)* | Pausa la música en la habitación indicada (o altavoz activo). |
 | `sonos_resume` | `room` *(opcional)* | Reanuda la reproducción. |
 | `sonos_stop` | `room` *(opcional)* | Detiene por completo la reproducción en el altavoz Sonos especificado. |

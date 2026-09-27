@@ -28,8 +28,10 @@ from music_resolver import (
     Resolution,
     Resolver,
     clean_youtube_url,
+    is_live_track,
     normalize_query,
     parse_genre_and_decade,
+    parse_live_intent,
     parse_sonos_didl,
 )
 
@@ -779,10 +781,88 @@ def resolve(
     provider: str | None = None,
     bypass_cache: bool = False,
     artist: str | None = None,
+    album: str | None = None,
+    live: bool | None = None,
 ) -> Resolution:
     if reindex or LIBRARY.count() == 0:
         sync_library(room, LIBRARY)
-    return RESOLVER.resolve(query, youtube_music_url=youtube_music_url, provider=provider, bypass_cache=bypass_cache, artist=artist)
+    return RESOLVER.resolve(
+        query,
+        youtube_music_url=youtube_music_url,
+        provider=provider,
+        bypass_cache=bypass_cache,
+        artist=artist,
+        album=album,
+        live=live,
+    )
+
+
+def search_tracks(
+    query: str,
+    artist: str | None = None,
+    album: str | None = None,
+    live: bool | None = None,
+    provider: str | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    clean_q, inferred_live = parse_live_intent(query)
+    effective_live = live if live is not None else inferred_live
+    clean_artist = artist.strip() if artist else None
+    clean_album = album.strip() if album else None
+    target_provider = provider.strip().lower() if provider else "auto"
+
+    results: list[dict[str, Any]] = []
+
+    # 1. Search local Samba library
+    if target_provider in {"auto", "samba"}:
+        local_tracks = LIBRARY.search_many(
+            clean_q, limit=limit, artist=clean_artist, album=clean_album, live=effective_live
+        )
+        for t in local_tracks:
+            results.append({
+                "title": t["title"],
+                "artist": t.get("artist", ""),
+                "album": t.get("album", ""),
+                "genre": t.get("genre", ""),
+                "year": t.get("year"),
+                "provider": "samba",
+                "kind": "uri",
+                "target": t["uri"],
+                "is_live": is_live_track(t["title"], t.get("album", "")),
+            })
+
+    # 2. Search YouTube
+    if target_provider in {"auto", "youtube", "youtube_music"}:
+        yt_needed = limit if target_provider != "auto" else max(0, limit - len(results))
+        if yt_needed > 0 or target_provider != "auto":
+            parts = [clean_q]
+            if clean_artist:
+                parts.append(clean_artist)
+            if clean_album:
+                parts.append(clean_album)
+            if effective_live is False:
+                parts.append("studio")
+            elif effective_live is True:
+                parts.append("live")
+            yt_query = " ".join(parts).strip()
+            try:
+                yt_tracks = search_youtube_many(yt_query, limit=yt_needed or 3)
+                for t in yt_tracks:
+                    results.append({
+                        "title": t["title"],
+                        "artist": t.get("artist", ""),
+                        "album": clean_album or "",
+                        "genre": "",
+                        "year": None,
+                        "provider": "youtube",
+                        "kind": "url",
+                        "target": t["url"],
+                        "is_live": is_live_track(t["title"], ""),
+                    })
+            except Exception as error:
+                logger.warning("YouTube search failed in search_tracks: %s", error)
+
+    return results[:limit]
 
 
 def resolve_youtube_album(query: str, artist: str, bypass_cache: bool = False) -> dict:
@@ -870,6 +950,8 @@ def resolve_and_play(
     bypass_cache: bool = False,
     youtube_music_url: str | None = None,
     action: str = "play",
+    album: str | None = None,
+    live: bool | None = None,
 ) -> dict:
     if mode not in {"track", "list", "album", "artist", "genre"}:
         raise ValueError("mode must be track, list, album, artist, or genre")
@@ -1121,7 +1203,7 @@ def resolve_and_play(
         return payload
 
     clean_artist = artist.strip() if artist else None
-    resolution = resolve(query, room, youtube_music_url, False, provider, bypass_cache, artist=clean_artist)
+    resolution = resolve(query, room, youtube_music_url, False, provider, bypass_cache, artist=clean_artist, album=album, live=live)
     payload = {"ok": True, "resolution": asdict(resolution)}
     if action == "play":
         payload["result"] = play_resolution(room, resolution)
@@ -1190,7 +1272,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        if parsed.path in {"/health", "/status", "/library/status"}:
+        if parsed.path in {"/health", "/status", "/library/status", "/search"}:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -1298,6 +1380,27 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/library/status":
                 self.respond(HTTPStatus.OK, {"ok": True, "library": library_status(LIBRARY)})
                 return
+            if parsed.path == "/search":
+                qs = parse_qs(parsed.query)
+                query_val = qs.get("query", qs.get("q", [""]))[0]
+                query = validate_query(query_val)
+                artist = qs.get("artist", [None])[0]
+                album = qs.get("album", [None])[0]
+                live_raw = qs.get("live", [None])[0]
+                if live_raw is None:
+                    live = None
+                elif live_raw.strip().lower() in {"true", "1", "yes"}:
+                    live = True
+                elif live_raw.strip().lower() in {"false", "0", "no"}:
+                    live = False
+                else:
+                    live = None
+                provider = qs.get("provider", [None])[0]
+                limit_raw = qs.get("limit", [5])[0]
+                limit = int(limit_raw) if str(limit_raw).isdigit() else 5
+                tracks = search_tracks(query=query, artist=artist, album=album, live=live, provider=provider, limit=limit)
+                self.respond(HTTPStatus.OK, {"ok": True, "query": query, "count": len(tracks), "tracks": tracks})
+                return
             self.respond(*fail("not found", HTTPStatus.NOT_FOUND))
         except (ValueError, RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, ET.ParseError) as error:
             logger.warning("[%s %s] Error: %s", self.command, getattr(self, "path", ""), error)
@@ -1332,6 +1435,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             data = self.read_json()
+            if self.path == "/search":
+                query = validate_query(data.get("query", data.get("q")))
+                artist = data.get("artist")
+                album = data.get("album")
+                live = data.get("live")
+                provider = data.get("provider")
+                limit = data.get("limit", 5)
+                if not isinstance(limit, int) or not 1 <= limit <= 50:
+                    limit = 5
+                if artist is not None and not isinstance(artist, str):
+                    raise ValueError("artist must be a string")
+                if album is not None and not isinstance(album, str):
+                    raise ValueError("album must be a string")
+                if live is not None and not isinstance(live, bool):
+                    raise ValueError("live must be boolean")
+                tracks = search_tracks(query=query, artist=artist, album=album, live=live, provider=provider, limit=limit)
+                self.respond(HTTPStatus.OK, {"ok": True, "query": query, "count": len(tracks), "tracks": tracks})
+                return
             if self.path == "/library/reindex":
                 raw_room = data.get("room")
                 target_room = validate_room(raw_room) if raw_room else None
@@ -1380,6 +1501,8 @@ class Handler(BaseHTTPRequestHandler):
                 mode = data.get("mode", "track")
                 limit = data.get("limit", 10)
                 artist = data.get("artist") or ""
+                album = data.get("album")
+                live = data.get("live")
                 genre = data.get("genre")
                 decade = data.get("decade")
                 shuffle = data.get("shuffle", True)
@@ -1390,6 +1513,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("provider must be a string")
                 if artist is not None and not isinstance(artist, str):
                     raise ValueError("artist must be a string")
+                if album is not None and not isinstance(album, str):
+                    raise ValueError("album must be a string")
+                if live is not None and not isinstance(live, bool):
+                    raise ValueError("live must be boolean")
                 if genre is not None and not isinstance(genre, str):
                     raise ValueError("genre must be a string")
                 if decade is not None and not isinstance(decade, int):
@@ -1417,6 +1544,8 @@ class Handler(BaseHTTPRequestHandler):
                     bypass_cache=bypass_cache,
                     youtube_music_url=youtube_music_url,
                     action=action,
+                    album=album,
+                    live=live,
                 )
                 self.respond(HTTPStatus.OK, payload)
                 return

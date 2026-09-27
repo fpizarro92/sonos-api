@@ -92,6 +92,56 @@ def _artist_matches(target_artist: str, candidate_artist: str) -> bool:
     return False
 
 
+LIVE_PATTERNS = re.compile(
+    r"\b(live|en vivo|en directo|directo|concert|concierto|tour|acoustic live|unplugged|flashpoint|stripped|live at|live from)\b",
+    re.IGNORECASE,
+)
+STUDIO_QUERY_PATTERNS = re.compile(
+    r"\b(versi[oó]n\s+(?:de\s+)?estudio|de estudio|en estudio|studio version|studio mix|studio)\b",
+    re.IGNORECASE,
+)
+LIVE_QUERY_PATTERNS = re.compile(
+    r"\b(versi[oó]n\s+(?:en\s+)?(?:vivo|directo)|en vivo|en directo|en concierto|live version|live)\b",
+    re.IGNORECASE,
+)
+
+
+def is_live_track(title: str, album: str = "") -> bool:
+    """Check if title or album name indicates a live recording."""
+    combined = f"{title} {album}"
+    return bool(LIVE_PATTERNS.search(combined))
+
+
+def parse_live_intent(query: str) -> tuple[str, bool | None]:
+    """Extract explicit live/studio intent from query and return (cleaned_query, live_flag)."""
+    if STUDIO_QUERY_PATTERNS.search(query):
+        clean_q = STUDIO_QUERY_PATTERNS.sub(" ", query)
+        clean_q = " ".join(clean_q.split()).strip()
+        return clean_q or query, False
+    if LIVE_QUERY_PATTERNS.search(query):
+        clean_q = LIVE_QUERY_PATTERNS.sub(" ", query)
+        clean_q = " ".join(clean_q.split()).strip()
+        return clean_q or query, True
+    return query, None
+
+
+def _album_matches(target_album: str, candidate_album: str) -> bool:
+    norm_target = normalize_query(target_album)
+    norm_cand = normalize_query(candidate_album)
+    if not norm_target or not norm_cand:
+        return False
+    if norm_target == norm_cand:
+        return True
+    if norm_target in norm_cand or norm_cand in norm_target:
+        return True
+    t_clean = re.sub(r"^(the|los|las|el|la)\s+", "", norm_target).strip()
+    c_clean = re.sub(r"^(the|los|las|el|la)\s+", "", norm_cand).strip()
+    if t_clean and c_clean and (t_clean == c_clean or t_clean in c_clean or c_clean in t_clean):
+        return True
+    ratio = difflib.SequenceMatcher(None, norm_target, norm_cand).ratio()
+    return ratio >= 0.72
+
+
 def parse_sonos_didl(didl: str) -> list[dict[str, str]]:
     if not didl.strip():
         return []
@@ -371,8 +421,20 @@ class LibraryIndex:
                 "INSERT INTO library_tracks_fts(rowid, title, artist, album, genre) SELECT rowid, title, artist, album, genre FROM library_tracks"
             )
 
-    def search_many(self, query: str, limit: int = 10, artist: str | None = None) -> list[dict[str, str]]:
+    def search_many(
+        self,
+        query: str,
+        limit: int = 10,
+        artist: str | None = None,
+        album: str | None = None,
+        live: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        clean_q, inferred_live = parse_live_intent(query)
+        effective_live = live if live is not None else inferred_live
+        query = clean_q
         clean_artist = artist.strip() if artist else ""
+        clean_album = album.strip() if album else ""
+
         tokens = TOKEN_RE.findall(normalize_query(query))
         if not tokens:
             return []
@@ -420,6 +482,13 @@ class LibraryIndex:
         for row in rows:
             if clean_artist and not _artist_matches(clean_artist, row["artist"]):
                 continue
+            if clean_album and not _album_matches(clean_album, row["album"]):
+                continue
+
+            is_live = is_live_track(row["title"], row["album"])
+            if effective_live is False and is_live:
+                continue
+
             score = (
                 len(wanted & _tokens(row["title"])) * 3
                 + len(wanted & _tokens(row["artist"])) * 2
@@ -428,7 +497,14 @@ class LibraryIndex:
             )
             if normalized_query in normalize_query(row["title"]):
                 score += 10
+            if clean_album and _album_matches(clean_album, row["album"]):
+                score += 50
+            if effective_live is True and is_live:
+                score += 30
+            elif effective_live is False and not is_live:
+                score += 20
             ranked.append((score, row))
+
         ranked.sort(key=lambda item: (-item[0], item[1]["title"], item[1]["artist"]))
         results = [dict(row) for _, row in ranked[:limit]]
         if results:
@@ -457,7 +533,9 @@ class LibraryIndex:
                     if corrected_query != query:
                         break
                 if corrected_query != query:
-                    fuzzy_results = self.search_many(corrected_query, limit=limit, artist=clean_artist or None)
+                    fuzzy_results = self.search_many(
+                        corrected_query, limit=limit, artist=clean_artist or None, album=clean_album or None, live=effective_live
+                    )
                     if fuzzy_results:
                         return fuzzy_results
 
@@ -481,6 +559,12 @@ class LibraryIndex:
                 if fuzzy_rows:
                     if clean_artist:
                         fuzzy_rows = [r for r in fuzzy_rows if _artist_matches(clean_artist, r["artist"])]
+                    if clean_album:
+                        fuzzy_rows = [r for r in fuzzy_rows if _album_matches(clean_album, r["album"])]
+                    if effective_live is False:
+                        fuzzy_rows = [r for r in fuzzy_rows if not is_live_track(r["title"], r["album"])]
+                    elif effective_live is True:
+                        fuzzy_rows = sorted(fuzzy_rows, key=lambda r: 0 if is_live_track(r["title"], r["album"]) else 1)
                     if fuzzy_rows:
                         return [dict(r) for r in fuzzy_rows[:limit]]
 
@@ -704,11 +788,17 @@ class LibraryIndex:
         with self.database.connect() as connection:
             return int(connection.execute("SELECT COUNT(*) FROM library_tracks").fetchone()[0])
 
-    def search(self, query: str, artist: str | None = None) -> dict[str, str] | None:
-        matches = self.search_many(query, limit=1, artist=artist)
+    def search(
+        self,
+        query: str,
+        artist: str | None = None,
+        album: str | None = None,
+        live: bool | None = None,
+    ) -> dict[str, str] | None:
+        matches = self.search_many(query, limit=1, artist=artist, album=album, live=live)
         if matches:
             return matches[0]
-        if not artist:
+        if not artist and not album and live is None:
             p_genre, p_decade = parse_genre_and_decade(query)
             if p_genre or p_decade:
                 genre_matches = self.search_genre(genre=p_genre, decade=p_decade, limit=1, shuffle=True)
@@ -827,24 +917,50 @@ class Resolver:
         bypass_cache: bool = False,
         now: int | None = None,
         artist: str | None = None,
+        album: str | None = None,
+        live: bool | None = None,
     ) -> Resolution:
+        clean_q, inferred_live = parse_live_intent(query)
+        effective_live = live if live is not None else inferred_live
+        query = clean_q
         normalized = normalize_query(query)
         if not normalized:
             raise ValueError("query is required")
         clean_artist = artist.strip() if artist else None
-        cache_key = f"{normalized}::artist::{normalize_query(clean_artist)}" if clean_artist and normalize_query(clean_artist) else normalized
+        clean_album = album.strip() if album else None
+
+        cache_parts = [normalized]
+        if clean_artist and normalize_query(clean_artist):
+            cache_parts.append(f"artist::{normalize_query(clean_artist)}")
+        if clean_album and normalize_query(clean_album):
+            cache_parts.append(f"album::{normalize_query(clean_album)}")
+        if effective_live is not None:
+            cache_parts.append(f"live::{effective_live}")
+        cache_key = "::".join(cache_parts)
+
         cache_provider = provider if provider in {"samba", "youtube", "youtube_music"} else None
         cached = None if bypass_cache else self.cache.get(cache_key, now=now, provider=cache_provider)
         if cached is not None:
             return cached
+
+        yt_parts = [query]
+        if clean_artist:
+            yt_parts.append(clean_artist)
+        if clean_album:
+            yt_parts.append(clean_album)
+        if effective_live is False:
+            yt_parts.append("studio version")
+        elif effective_live is True:
+            yt_parts.append("live")
+        yt_query = " ".join(yt_parts).strip()
+
         if provider == "youtube":
-            yt_query = f"{query} {clean_artist}".strip() if clean_artist else normalized
             resolution = self.youtube_search(yt_query)
             self.cache.put(cache_key, resolution, ttl_seconds=7 * 24 * 60 * 60, now=now)
             return resolution
         if provider not in {None, "samba", "youtube_music"}:
             raise ValueError("provider must be samba, youtube, or youtube_music")
-        local = None if provider == "youtube_music" else self.library.search(normalized, artist=clean_artist)
+        local = None if provider == "youtube_music" else self.library.search(normalized, artist=clean_artist, album=clean_album, live=effective_live)
         if local is not None:
             resolution = Resolution("samba", "uri", local["uri"], local["title"], local["artist"], local["album"])
             self.cache.put(cache_key, resolution, ttl_seconds=90 * 24 * 60 * 60, now=now)
@@ -853,6 +969,10 @@ class Resolver:
             msg = f"No local track found for: {query}"
             if clean_artist:
                 msg += f" by {clean_artist}"
+            if clean_album:
+                msg += f" in album {clean_album}"
+            if effective_live is False:
+                msg += " (studio version)"
             raise RuntimeError(msg)
         if youtube_music_url:
             cleaned_url = clean_youtube_url(youtube_music_url)
@@ -863,7 +983,6 @@ class Resolver:
             resolution = Resolution("youtube_music", "url", cleaned_url, normalized)
             self.cache.put(cache_key, resolution, ttl_seconds=14 * 24 * 60 * 60, now=now)
             return resolution
-        yt_query = f"{query} {clean_artist}".strip() if clean_artist else normalized
         resolution = self.youtube_search(yt_query)
         self.cache.put(cache_key, resolution, ttl_seconds=7 * 24 * 60 * 60, now=now)
         return resolution

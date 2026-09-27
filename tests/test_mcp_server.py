@@ -20,14 +20,33 @@ class MockBackend:
     def get_room(self, room=None):
         return room or "Sala de estar"
 
-    def play_music(self, query, room=None, mode="track", artist=None, genre=None, decade=None, shuffle=True, **kwargs):
-        self.calls.append(("play_music", query, room, mode, artist, genre, decade, shuffle))
+    def play_music(self, query, room=None, mode="track", artist=None, album=None, live=None, genre=None, decade=None, shuffle=True, **kwargs):
+        self.calls.append(("play_music", query, room, mode, artist, album, live, genre, decade, shuffle))
         return {
             "ok": True,
             "query": query,
             "room": room or "Sala de estar",
             "mode": mode,
-            "status": {"transport": {"State": "PLAYING"}}
+            "status": {"transport": {"State": "PLAYING"}},
+            "album": album,
+            "live": live,
+        }
+
+    def search_music(self, query, artist=None, album=None, live=None, provider=None, limit=10):
+        self.calls.append(("search_music", query, artist, album, live, provider, limit))
+        return {
+            "ok": True,
+            "query": query,
+            "count": 1,
+            "tracks": [
+                {
+                    "title": query,
+                    "artist": artist or "The Rolling Stones",
+                    "album": album or "Aftermath",
+                    "is_live": False if live is False else bool(live),
+                    "provider": provider or "samba",
+                }
+            ],
         }
 
     def pause(self, room=None):
@@ -110,6 +129,7 @@ class MCPServerTests(unittest.TestCase):
         tool_names = {t["name"] for t in tools}
         expected = {
             "sonos_play_music",
+            "sonos_search_music",
             "sonos_pause",
             "sonos_resume",
             "sonos_stop",
@@ -149,6 +169,67 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(content["room"], "Sala de estar")
         self.assertEqual(content["mode"], "artist")
         self.assertEqual(len(self.backend.calls), 1)
+
+    def test_call_sonos_play_music_with_album_and_live(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 112,
+            "method": "tools/call",
+            "params": {
+                "name": "sonos_play_music",
+                "arguments": {
+                    "query": "Paint It Black",
+                    "album": "Aftermath",
+                    "live": False,
+                }
+            }
+        }
+        res = self.server.handle_jsonrpc(req)
+        self.assertFalse(res["result"]["isError"])
+        content = json.loads(res["result"]["content"][0]["text"])
+        self.assertEqual(content["query"], "Paint It Black")
+        self.assertEqual(content["album"], "Aftermath")
+        self.assertIs(content["live"], False)
+
+    def test_call_sonos_search_music(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 113,
+            "method": "tools/call",
+            "params": {
+                "name": "sonos_search_music",
+                "arguments": {
+                    "query": "Paint It Black",
+                    "artist": "The Rolling Stones",
+                    "album": "Aftermath",
+                    "live": False,
+                    "provider": "samba",
+                    "limit": 5,
+                }
+            }
+        }
+        res = self.server.handle_jsonrpc(req)
+        self.assertFalse(res["result"]["isError"])
+        content = json.loads(res["result"]["content"][0]["text"])
+        self.assertTrue(content["ok"])
+        self.assertEqual(content["query"], "Paint It Black")
+        self.assertEqual(len(content["tracks"]), 1)
+        self.assertEqual(content["tracks"][0]["album"], "Aftermath")
+        self.assertIs(content["tracks"][0]["is_live"], False)
+
+    def test_call_sonos_search_music_missing_query(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 114,
+            "method": "tools/call",
+            "params": {
+                "name": "sonos_search_music",
+                "arguments": {}
+            }
+        }
+        res = self.server.handle_jsonrpc(req)
+        self.assertTrue(res["result"]["isError"])
+        self.assertIn("obligatorio", res["result"]["content"][0]["text"])
 
     def test_call_sonos_play_music_genre_only(self):
         req = {

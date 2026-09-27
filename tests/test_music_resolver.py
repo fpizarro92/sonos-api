@@ -9,7 +9,16 @@ APP = ROOT / "app"
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
-from music_resolver import CacheStore, LibraryIndex, Resolution, normalize_query, parse_sonos_didl, strip_accents
+from music_resolver import (
+    CacheStore,
+    LibraryIndex,
+    Resolution,
+    is_live_track,
+    normalize_query,
+    parse_live_intent,
+    parse_sonos_didl,
+    strip_accents,
+)
 
 
 class MusicResolverTests(unittest.TestCase):
@@ -300,6 +309,102 @@ class MusicResolverTests(unittest.TestCase):
         samba_res = resolver.resolve("Silencio", artist="Alejandro Sanz", now=1_000)
         self.assertEqual(samba_res.provider, "samba")
         self.assertEqual(samba_res.artist, "Alejandro Sanz")
+
+    def test_parse_live_intent(self):
+        cleaned, live = parse_live_intent("paint it black de estudio")
+        self.assertEqual(cleaned, "paint it black")
+        self.assertIs(live, False)
+
+        cleaned, live = parse_live_intent("paint it black version estudio")
+        self.assertEqual(cleaned, "paint it black")
+        self.assertIs(live, False)
+
+        cleaned, live = parse_live_intent("hotel california en vivo")
+        self.assertEqual(cleaned, "hotel california")
+        self.assertIs(live, True)
+
+        cleaned, live = parse_live_intent("hotel california live")
+        self.assertEqual(cleaned, "hotel california")
+        self.assertIs(live, True)
+
+        cleaned, live = parse_live_intent("paint it black")
+        self.assertEqual(cleaned, "paint it black")
+        self.assertIsNone(live)
+
+    def test_is_live_track(self):
+        self.assertTrue(is_live_track("Paint It, Black (Live)", "Flashpoint"))
+        self.assertTrue(is_live_track("Paint It, Black", "Flashpoint"))
+        self.assertTrue(is_live_track("Paint It, Black", "Live at Leeds"))
+        self.assertTrue(is_live_track("Comfortably Numb (Live at Pompeii)", "The Wall"))
+        self.assertFalse(is_live_track("Paint It, Black", "Aftermath"))
+        self.assertFalse(is_live_track("Comfortably Numb", "The Wall"))
+
+    def test_library_search_with_album_and_live_filter(self):
+        index = LibraryIndex(self.db_path)
+        index.replace_tracks(
+            [
+                {"uri": "x-file-cifs://server/music/stones-studio.mp3", "title": "Paint It, Black", "artist": "The Rolling Stones", "album": "Aftermath"},
+                {"uri": "x-file-cifs://server/music/stones-live.mp3", "title": "Paint It, Black (Live)", "artist": "The Rolling Stones", "album": "Flashpoint"},
+            ]
+        )
+
+        # live=False must return Aftermath studio version
+        studio = index.search("Paint It, Black", live=False)
+        self.assertIsNotNone(studio)
+        self.assertEqual(studio["album"], "Aftermath")
+
+        # live=True must return Flashpoint live version
+        live = index.search("Paint It, Black", live=True)
+        self.assertIsNotNone(live)
+        self.assertEqual(live["album"], "Flashpoint")
+
+        # album filter
+        aftermath = index.search("Paint It, Black", album="Aftermath")
+        self.assertIsNotNone(aftermath)
+        self.assertEqual(aftermath["album"], "Aftermath")
+
+        flashpoint = index.search("Paint It, Black", album="Flashpoint")
+        self.assertIsNotNone(flashpoint)
+        self.assertEqual(flashpoint["album"], "Flashpoint")
+
+        # Non-matching album returns None
+        non_matching = index.search("Paint It, Black", album="Beggars Banquet")
+        self.assertIsNone(non_matching)
+
+    def test_resolver_skips_live_samba_when_studio_requested(self):
+        from music_resolver import Resolver
+
+        # Only Flashpoint (live) is in Samba
+        library = LibraryIndex(self.db_path)
+        library.replace_tracks(
+            [
+                {"uri": "x-file-cifs://server/music/stones-live.mp3", "title": "Paint It, Black (Live)", "artist": "The Rolling Stones", "album": "Flashpoint"},
+            ]
+        )
+
+        called_yt = []
+        def mock_yt(q):
+            called_yt.append(q)
+            return Resolution("youtube", "url", f"https://www.youtube.com/watch?v=mock_{q}", "Paint It, Black", artist="The Rolling Stones")
+
+        resolver = Resolver(CacheStore(self.db_path), library, mock_yt)
+
+        # Request studio version explicitly: live=False
+        res = resolver.resolve("Paint It, Black", live=False, now=1_000)
+        self.assertEqual(res.provider, "youtube")
+        self.assertIn("Paint It, Black studio version", called_yt)
+
+        # Request studio version via natural language query: "paint it black de estudio"
+        called_yt.clear()
+        res_nl = resolver.resolve("Paint It, Black de estudio", bypass_cache=True, now=1_000)
+        self.assertEqual(res_nl.provider, "youtube")
+        self.assertIn("Paint It, Black studio version", called_yt)
+
+        # Request specific album not in Samba: album="Aftermath"
+        called_yt.clear()
+        res_album = resolver.resolve("Paint It, Black", album="Aftermath", bypass_cache=True, now=1_000)
+        self.assertEqual(res_album.provider, "youtube")
+        self.assertIn("Paint It, Black Aftermath", called_yt)
 
 
 if __name__ == "__main__":

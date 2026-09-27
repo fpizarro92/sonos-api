@@ -55,6 +55,14 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Filtro opcional para precisar el artista cuando hay nombres ambiguos."
                 },
+                "album": {
+                    "type": "string",
+                    "description": "Filtro opcional para precisar el álbum específico (ej. 'Aftermath') y evitar versiones de otros discos."
+                },
+                "live": {
+                    "type": "boolean",
+                    "description": "Filtro opcional: True para forzar versiones en vivo, False para forzar versiones de estudio (excluyendo o penalizando álbumes en vivo)."
+                },
                 "genre": {
                     "type": "string",
                     "description": "Género musical (ej. 'Rock', 'Pop', 'Jazz', 'Heavy Metal') cuando se busca por estilo."
@@ -72,6 +80,41 @@ TOOL_DEFINITIONS = [
                     "description": "Si es true, ignora la caché de resoluciones previas y fuerza una consulta fresca. Por defecto: false."
                 }
             }
+        }
+    },
+    {
+        "name": "sonos_search_music",
+        "description": "Busca canciones y devuelve una lista de opciones coincidentes con metadatos (título, artista, álbum, año, proveedor Samba/YouTube, versión en vivo o de estudio) SIN reproducir. Permite al usuario o asistente elegir entre varias versiones (ej. estudio vs en vivo, remaster vs original).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Nombre de la canción o término de búsqueda."
+                },
+                "artist": {
+                    "type": "string",
+                    "description": "Filtro opcional para precisar el artista o banda."
+                },
+                "album": {
+                    "type": "string",
+                    "description": "Filtro opcional para precisar el álbum específico (ej. 'Aftermath')."
+                },
+                "live": {
+                    "type": "boolean",
+                    "description": "True para buscar solo versiones en vivo, False para forzar versiones de estudio."
+                },
+                "provider": {
+                    "type": "string",
+                    "enum": ["auto", "samba", "youtube"],
+                    "description": "Fuente de música: 'auto' (Samba con fallback a YouTube), 'samba' (solo biblioteca local) o 'youtube'. Por defecto: 'auto'."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Número máximo de resultados a devolver. Por defecto: 5."
+                }
+            },
+            "required": ["query"]
         }
     },
     {
@@ -410,6 +453,8 @@ class DefaultBackend:
         room: Optional[str] = None,
         mode: str = "track",
         artist: Optional[str] = None,
+        album: Optional[str] = None,
+        live: Optional[bool] = None,
         genre: Optional[str] = None,
         decade: Optional[int] = None,
         shuffle: bool = True,
@@ -433,9 +478,37 @@ class DefaultBackend:
             limit=limit or 10,
             bypass_cache=bypass_cache,
             youtube_music_url=None,
+            album=album,
+            live=live,
         )
         resolved["status"] = srv.get_room_status(target_room)
         return enrich_playback_payload(resolved, target_room, server_module=srv)
+
+    def search_music(
+        self,
+        query: str,
+        artist: Optional[str] = None,
+        album: Optional[str] = None,
+        live: Optional[bool] = None,
+        provider: Optional[str] = None,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        srv = self._server()
+        provider_val = provider.strip().lower() if provider and provider.strip().lower() != "auto" else None
+        results = srv.search_tracks(
+            query=query,
+            artist=artist,
+            album=album,
+            live=live,
+            provider=provider_val,
+            limit=limit or 5,
+        )
+        return {
+            "ok": True,
+            "query": query,
+            "count": len(results),
+            "tracks": results,
+        }
 
     def pause(self, room: Optional[str] = None) -> Dict[str, Any]:
         srv = self._server()
@@ -565,12 +638,26 @@ class MCPServer:
                     room=args.get("room"),
                     mode=args.get("mode", "track"),
                     artist=args.get("artist"),
+                    album=args.get("album"),
+                    live=args.get("live"),
                     genre=genre,
                     decade=args.get("decade"),
                     shuffle=args.get("shuffle", True),
                     provider=args.get("provider"),
                     limit=args.get("limit", 10),
                     bypass_cache=args.get("bypass_cache", False),
+                )
+            elif name == "sonos_search_music":
+                query = args.get("query")
+                if not query:
+                    raise ValueError("El parámetro 'query' es obligatorio.")
+                result = self.backend.search_music(
+                    query=query,
+                    artist=args.get("artist"),
+                    album=args.get("album"),
+                    live=args.get("live"),
+                    provider=args.get("provider"),
+                    limit=args.get("limit", 5),
                 )
             elif name == "sonos_pause":
                 result = self.backend.pause(room=args.get("room"))
