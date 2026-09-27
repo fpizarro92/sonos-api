@@ -111,7 +111,7 @@ Estado del servicio, versión y configuración de cron.
 {
   "ok": true,
   "service": "sonos-api",
-  "version": "2.0",
+  "version": "2.1.0",
   "scheduled_reindex": "0 4 * * *",
   "timezone": "America/Santiago"
 }

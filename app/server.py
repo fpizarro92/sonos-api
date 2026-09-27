@@ -988,6 +988,14 @@ def resolve_and_play(
 
 
 try:
+    from _version import __version__
+except ImportError:
+    try:
+        from app._version import __version__
+    except ImportError:
+        from ._version import __version__
+
+try:
     from mcp_server import MCPServer, SSEManager
 except ImportError:
     try:
@@ -1000,7 +1008,7 @@ MCP_SSE_MANAGER = SSEManager(MCP_SERVER)
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SonosPrivateAPI/2.0"
+    server_version = f"SonosPrivateAPI/{__version__}"
 
     def log_message(self, format: str, *args: object) -> None:
         if getattr(self, "path", "").startswith("/health"):
@@ -1091,7 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(HTTPStatus.OK, {
                     "ok": True,
                     "service": "sonos-api",
-                    "version": "2.0",
+                    "version": __version__,
                     "mcp": True,
                     "scheduled_reindex": REINDEX_CRON or None,
                     "timezone": REINDEX_TIMEZONE if REINDEX_CRON else None,

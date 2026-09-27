@@ -139,8 +139,18 @@ class ServerImprovementsTests(unittest.TestCase):
             )
 
 
+    def test_centralized_version(self):
+        import _version
+        import mcp_server
+        server = load_server()
+
+        self.assertEqual(mcp_server.SERVER_VERSION, _version.__version__)
+        self.assertEqual(server.Handler.server_version, f"SonosPrivateAPI/{_version.__version__}")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

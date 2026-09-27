@@ -10,9 +10,17 @@ from urllib.parse import quote
 
 logger = logging.getLogger("sonos_mcp")
 
+try:
+    from _version import __version__
+except ImportError:
+    try:
+        from app._version import __version__
+    except ImportError:
+        from ._version import __version__
+
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "sonos-api-mcp"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = __version__
 
 TOOL_DEFINITIONS = [
     {
