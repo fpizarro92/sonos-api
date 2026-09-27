@@ -9,12 +9,52 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
 SPANISH_CARRIER_WORDS = {"pon", "reproduce", "cancion", "canciones", "tema", "temas", "disco", "album", "musica"}
 ALLOWED_MEDIA_HOSTS = {"youtube.com", "www.youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be"}
+
+
+def clean_youtube_url(url: str) -> str:
+    """Normalize YouTube and YouTube Music URLs to canonical https://www.youtube.com/watch?v=ID."""
+    if not isinstance(url, str) or not url.strip():
+        return url
+    url = url.strip()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in ALLOWED_MEDIA_HOSTS:
+        return url
+    qs = parse_qs(parsed.query)
+
+    # 1. /watch?v=VIDEO_ID
+    if "v" in qs and qs["v"] and re.fullmatch(r"[A-Za-z0-9_-]{6,20}", qs["v"][0]):
+        vid = qs["v"][0]
+        if "list" in qs and qs["list"] and re.fullmatch(r"[A-Za-z0-9_-]+", qs["list"][0]):
+            return f"https://www.youtube.com/watch?v={vid}&list={qs['list'][0]}"
+        return f"https://www.youtube.com/watch?v={vid}"
+
+    # 2. youtu.be/VIDEO_ID
+    if host == "youtu.be":
+        vid = parsed.path.strip("/").split("/")[0]
+        if re.fullmatch(r"[A-Za-z0-9_-]{6,20}", vid):
+            return f"https://www.youtube.com/watch?v={vid}"
+
+    # 3. /shorts/VIDEO_ID, /embed/VIDEO_ID, /v/VIDEO_ID
+    for prefix in ("/shorts/", "/embed/", "/v/"):
+        if parsed.path.startswith(prefix):
+            vid = parsed.path[len(prefix):].split("/")[0]
+            if re.fullmatch(r"[A-Za-z0-9_-]{6,20}", vid):
+                return f"https://www.youtube.com/watch?v={vid}"
+
+    # 4. /playlist?list=PLAYLIST_ID
+    if parsed.path.startswith("/playlist") and "list" in qs and qs["list"]:
+        lid = qs["list"][0]
+        if re.fullmatch(r"[A-Za-z0-9_-]+", lid):
+            return f"https://www.youtube.com/playlist?list={lid}"
+
+    return url
 
 
 def strip_accents(value: str) -> str:
@@ -815,11 +855,12 @@ class Resolver:
                 msg += f" by {clean_artist}"
             raise RuntimeError(msg)
         if youtube_music_url:
-            parsed = urlparse(youtube_music_url)
+            cleaned_url = clean_youtube_url(youtube_music_url)
+            parsed = urlparse(cleaned_url)
             host = (parsed.hostname or "").lower()
             if parsed.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
                 raise ValueError("youtube_music_url must be an HTTPS YouTube or YouTube Music URL")
-            resolution = Resolution("youtube_music", "url", youtube_music_url, normalized)
+            resolution = Resolution("youtube_music", "url", cleaned_url, normalized)
             self.cache.put(cache_key, resolution, ttl_seconds=14 * 24 * 60 * 60, now=now)
             return resolution
         yt_query = f"{query} {clean_artist}".strip() if clean_artist else normalized

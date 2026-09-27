@@ -27,6 +27,7 @@ from music_resolver import (
     LibraryIndex,
     Resolution,
     Resolver,
+    clean_youtube_url,
     normalize_query,
     parse_genre_and_decade,
     parse_sonos_didl,
@@ -74,6 +75,9 @@ def resolve_public_host(target_hint: str | None = None) -> str:
 PUBLIC_HOST = resolve_public_host()
 STREAM_BITRATE = os.getenv("SONOS_STREAM_BITRATE", "320k")
 YOUTUBE_STREAMS: dict[str, str] = {}
+STREAM_URL_CACHE: dict[str, tuple[str, float]] = {}
+STREAM_URL_CACHE_TTL = 7200  # 2 hours
+MAX_ACTIVE_STREAMS = 1000
 IMAGE_SOURCES: dict[str, str] = {}
 DATA_DIR = Path("/data")
 DATABASE_PATH = DATA_DIR / "music-cache.sqlite"
@@ -119,11 +123,12 @@ def is_youtube_url(value: str) -> bool:
 def validate_youtube_url(value: object) -> str:
     if not isinstance(value, str) or len(value) > 2048:
         raise ValueError("url is required")
-    parsed = urlparse(value)
+    cleaned = clean_youtube_url(value)
+    parsed = urlparse(cleaned)
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
         raise ValueError("url must be an HTTPS YouTube or YouTube Music URL")
-    return value
+    return cleaned
 
 
 def run_sonos(*args: str, timeout: int = 45) -> dict:
@@ -384,14 +389,37 @@ def select_youtube_music_artist(artist: str, limit: int = 25, fetcher=youtube_js
     raise RuntimeError(f"No YouTube Music tracks found for artist: {artist}")
 
 
-def resolve_youtube_stream(url: str) -> str:
+def resolve_youtube_stream(url: str, force_fresh: bool = False) -> str:
+    clean_url = clean_youtube_url(url)
+    now = time.time()
+    if not force_fresh and clean_url in STREAM_URL_CACHE:
+        cached_stream, cached_at = STREAM_URL_CACHE[clean_url]
+        if now - cached_at < STREAM_URL_CACHE_TTL:
+            logger.debug("Using cached YouTube stream for %s", clean_url)
+            return cached_stream
+
     completed = subprocess.run(
-        ["yt-dlp", "--no-playlist", "-f", "bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio", "-g", url],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, check=False,
+        [
+            "yt-dlp",
+            "--no-playlist",
+            "-f",
+            "bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio[ext=mp3]/bestaudio/best",
+            "--extract-flat",
+            "false",
+            "-g",
+            clean_url,
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        check=False,
     )
     if completed.returncode != 0 or not completed.stdout.strip():
         raise RuntimeError(completed.stderr.strip() or "Could not resolve YouTube audio")
-    return completed.stdout.strip().splitlines()[0]
+    stream_url = completed.stdout.strip().splitlines()[0]
+    STREAM_URL_CACHE[clean_url] = (stream_url, now)
+    return stream_url
 
 
 def discover_room(room: str) -> str:
@@ -420,6 +448,57 @@ def get_room_status(room: str) -> dict:
         return json.loads(result["stdout"])
     except Exception:
         return {}
+
+
+def get_transport_state(room: str) -> str | None:
+    # 1. Fast direct SOAP AVTransport query (typically 5-15ms)
+    try:
+        ip = discover_room(room)
+        res_xml = soap_action(
+            ip,
+            "urn:schemas-upnp-org:service:AVTransport:1",
+            "GetTransportInfo",
+            "<InstanceID>0</InstanceID>",
+        )
+        match = re.search(r"<CurrentTransportState>([^<]+)</CurrentTransportState>", res_xml)
+        if match:
+            return match.group(1).strip().upper()
+    except Exception:
+        pass
+
+    # 2. Fallback to sonos status
+    try:
+        status = get_room_status(room)
+        state = status.get("transport", {}).get("State")
+        if state:
+            return str(state).strip().upper()
+    except Exception:
+        pass
+    return None
+
+
+def wait_for_playback_state(
+    room: str,
+    target_states: set[str] | tuple[str, ...] = ("PLAYING",),
+    timeout: float = 4.0,
+    poll_interval: float = 0.2,
+) -> str | None:
+    targets = set(target_states)
+    start = time.time()
+    last_state = None
+    unreachable_count = 0
+    while time.time() - start < timeout:
+        state = get_transport_state(room)
+        if state:
+            last_state = state
+            if state in targets:
+                return state
+        else:
+            unreachable_count += 1
+            if unreachable_count >= 2:
+                break
+        time.sleep(poll_interval)
+    return last_state
 
 
 def soap_browse(ip: str, start_index: int, count: int) -> tuple[int, int, str]:
@@ -539,9 +618,32 @@ def play_youtube_list(room: str, tracks: list[dict[str, str]]) -> list[dict[str,
     queued = []
     for track in tracks:
         token = uuid.uuid4().hex
-        YOUTUBE_STREAMS[token] = track["url"]
-        queued.append({**track, "uri": f"http://{public_host}:{BIND_PORT}/stream/youtube/{token}", "protocol": "http-get"})
+        cleaned_url = clean_youtube_url(track["url"])
+        if len(YOUTUBE_STREAMS) >= MAX_ACTIVE_STREAMS:
+            oldest_key = next(iter(YOUTUBE_STREAMS))
+            YOUTUBE_STREAMS.pop(oldest_key, None)
+        YOUTUBE_STREAMS[token] = cleaned_url
+        queued.append({**track, "url": cleaned_url, "uri": f"http://{public_host}:{BIND_PORT}/stream/youtube/{token}", "protocol": "http-get"})
+
+    # Pre-warm stream for the first track so Sonos gets audio immediately without timeout
+    if queued:
+        try:
+            resolve_youtube_stream(queued[0]["url"])
+        except Exception as error:
+            logger.warning("Stream pre-warm failed for playlist first track: %s", error)
+
     play_local_list(room, queued)
+
+    # Confirm playback state and retry play once if STOPPED
+    state = wait_for_playback_state(room, target_states={"PLAYING"}, timeout=4.0, poll_interval=0.2)
+    if state == "STOPPED":
+        logger.warning("Sonos room '%s' is STOPPED after queueing playlist; attempting retry Play...", room)
+        try:
+            run_sonos("play", "--name", room)
+            wait_for_playback_state(room, target_states={"PLAYING"}, timeout=3.0, poll_interval=0.2)
+        except Exception as error:
+            logger.warning("Retry play failed: %s", error)
+
     return queued
 
 
@@ -709,10 +811,49 @@ def resolve_youtube_artist(artist: str, limit: int = 25, bypass_cache: bool = Fa
     return {"artist": artist, "tracks": tracks}
 
 
+def play_url_with_retry(room: str, url: str, max_retries: int = 1) -> dict:
+    clean_url = clean_youtube_url(url)
+
+    # Pre-warm: pre-resolve stream URL to validate format and cache direct URL
+    try:
+        resolve_youtube_stream(clean_url)
+    except Exception as error:
+        logger.warning("Stream pre-warm failed for %s: %s", clean_url, error)
+
+    last_result = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            logger.info(
+                "Playback in room '%s' was STOPPED or unconfirmed; re-resolving fresh stream and retrying (%d/%d)...",
+                room, attempt, max_retries,
+            )
+            STREAM_URL_CACHE.pop(clean_url, None)
+            try:
+                resolve_youtube_stream(clean_url, force_fresh=True)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        last_result = run_sonos("play-url", "--name", room, clean_url, timeout=90)
+
+        # Wait up to 4s for confirmed PLAYING
+        state = wait_for_playback_state(room, target_states={"PLAYING"}, timeout=4.0, poll_interval=0.2)
+        if state == "PLAYING":
+            logger.info("Room '%s' confirmed PLAYING on attempt %d", room, attempt + 1)
+            break
+        elif state == "STOPPED" and attempt < max_retries:
+            logger.warning("Room '%s' is STOPPED after play-url; attempting automatic retry...", room)
+            continue
+
+    return last_result
+
+
 def play_resolution(room: str, resolution: Resolution) -> dict:
     if resolution.kind == "uri":
-        return run_sonos("play-uri", "--name", room, resolution.target, "--title", resolution.title, timeout=90)
-    return run_sonos("play-url", "--name", room, resolution.target, timeout=90)
+        res = run_sonos("play-uri", "--name", room, resolution.target, "--title", resolution.title, timeout=90)
+        wait_for_playback_state(room, target_states={"PLAYING"}, timeout=3.0, poll_interval=0.2)
+        return res
+    return play_url_with_retry(room, resolution.target)
 
 
 def resolve_and_play(
@@ -1019,9 +1160,42 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
+
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/stream/youtube/"):
+            token = parsed.path.rsplit("/", 1)[-1]
+            if token not in YOUTUBE_STREAMS:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Connection", "close")
+            self.send_header("Accept-Ranges", "none")
+            self.end_headers()
+            return
+        if parsed.path.startswith("/image/"):
+            key = parsed.path.split("/image/", 1)[-1].strip()
+            img = get_image(key)
+            if img:
+                mime_type, data = img
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", mime_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=2592000")
+                self.end_headers()
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path in {"/health", "/status", "/library/status"}:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
 
     def respond(self, status: int, payload: dict) -> None:
         current_room = getattr(self, "_current_room", None)
@@ -1057,14 +1231,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 stream_url = resolve_youtube_stream(source_url)
-            except RuntimeError:
+            except RuntimeError as error:
+                logger.warning("Stream resolution failed for token %s (%s): %s", token, source_url, error)
                 self.send_error(HTTPStatus.BAD_GATEWAY)
                 return
-            process = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", stream_url, "-vn", "-f", "mp3", "-acodec", "libmp3lame", "-b:a", STREAM_BITRATE, "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            process = subprocess.Popen([
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                "-i", stream_url,
+                "-vn", "-f", "mp3",
+                "-acodec", "libmp3lame",
+                "-b:a", STREAM_BITRATE,
+                "-ar", "44100",
+                "-ac", "2",
+                "pipe:1"
+            ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             try:
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "audio/mpeg")
                 self.send_header("Connection", "close")
+                self.send_header("Accept-Ranges", "none")
                 self.end_headers()
                 while True:
                     chunk = process.stdout.read(64 * 1024)
@@ -1073,7 +1259,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
-                pass
+                logger.debug("Sonos client closed stream connection for token %s", token)
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -1171,6 +1357,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/play":
                 result = run_sonos("play", "--name", room)
+                wait_for_playback_state(room, target_states={"PLAYING"}, timeout=3.0, poll_interval=0.2)
                 self.respond(HTTPStatus.OK, {"ok": True, "action": "play", "room": room, "status": get_room_status(room), "result": result})
                 return
             if self.path == "/volume":
@@ -1182,7 +1369,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/play-url":
                 url = validate_youtube_url(data.get("url"))
-                result = run_sonos("play-url", "--name", room, url, timeout=90)
+                result = play_url_with_retry(room, url)
                 self.respond(HTTPStatus.OK, {"ok": True, "action": "play-url", "room": room, "url": url, "status": get_room_status(room), "result": result})
                 return
             if self.path in {"/resolve", "/resolve-and-play", "/search-and-play", "/resolve-list"}:
