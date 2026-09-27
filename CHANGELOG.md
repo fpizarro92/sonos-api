@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.2.0](https://github.com/fpizarro92/sonos-api/compare/v2.1.0...v2.2.0) (2026-09-27)
+
+
+### Features
+
+* add track search mode, album and live version filters, and sonos_search_music MCP tool ([be659e9](https://github.com/fpizarro92/sonos-api/commit/be659e91a67644368e210ab5db80958042d1b50b))
+
+
+### Bug Fixes
+
+* add stream preheating, url normalization, playback confirmation, and auto-retry on stopped ([9835878](https://github.com/fpizarro92/sonos-api/commit/9835878ae37011a9e9143384697fe0a35970e2f1))
+
 ## [2.1.0](https://github.com/fpizarro92/sonos-api/compare/v2.1.0...v2.1.0) (2026-09-27)
 
 
