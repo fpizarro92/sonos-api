@@ -676,10 +676,11 @@ def resolve(
     reindex: bool = False,
     provider: str | None = None,
     bypass_cache: bool = False,
+    artist: str | None = None,
 ) -> Resolution:
     if reindex or LIBRARY.count() == 0:
         sync_library(room, LIBRARY)
-    return RESOLVER.resolve(query, youtube_music_url=youtube_music_url, provider=provider, bypass_cache=bypass_cache)
+    return RESOLVER.resolve(query, youtube_music_url=youtube_music_url, provider=provider, bypass_cache=bypass_cache, artist=artist)
 
 
 def resolve_youtube_album(query: str, artist: str, bypass_cache: bool = False) -> dict:
@@ -930,8 +931,10 @@ def resolve_and_play(
 
     # 4. Mode: List
     if mode == "list":
+        clean_artist = artist.strip() if artist else None
+        yt_query = f"{query} {clean_artist}".strip() if clean_artist else query
         if provider in {"youtube", "youtube_music"} or is_url:
-            tracks = search_youtube_many(query, limit)
+            tracks = search_youtube_many(yt_query, limit)
             if not tracks:
                 raise RuntimeError("No YouTube tracks found for the list")
             resolved_tracks = play_youtube_list(room, tracks) if action == "play" else tracks
@@ -942,15 +945,18 @@ def resolve_and_play(
 
         if library.count() == 0:
             sync_library(room, library)
-        tracks = library.search_many(query, limit=limit)
-        if not tracks:
+        tracks = library.search_many(query, limit=limit, artist=clean_artist)
+        if not tracks and not clean_artist:
             p_genre, p_decade = parse_genre_and_decade(query)
             if p_genre or p_decade:
                 tracks = library.search_genre(genre=p_genre or None, decade=p_decade, limit=limit, shuffle=True)
         if not tracks:
             if provider == "samba":
-                raise RuntimeError("No local tracks found for the list")
-            tracks = search_youtube_many(query, limit)
+                err_msg = "No local tracks found for the list"
+                if clean_artist:
+                    err_msg += f" by {clean_artist}"
+                raise RuntimeError(err_msg)
+            tracks = search_youtube_many(yt_query, limit)
             if not tracks:
                 raise RuntimeError("No YouTube tracks found for the list")
             resolved_tracks = play_youtube_list(room, tracks) if action == "play" else tracks
@@ -973,7 +979,8 @@ def resolve_and_play(
             payload["result"] = play_resolution(room, resolution)
         return payload
 
-    resolution = resolve(query, room, youtube_music_url, False, provider, bypass_cache)
+    clean_artist = artist.strip() if artist else None
+    resolution = resolve(query, room, youtube_music_url, False, provider, bypass_cache, artist=clean_artist)
     payload = {"ok": True, "resolution": asdict(resolution)}
     if action == "play":
         payload["result"] = play_resolution(room, resolution)

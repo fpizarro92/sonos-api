@@ -126,8 +126,21 @@ class ServerImprovementsTests(unittest.TestCase):
         img = server.get_image("test_key")
         self.assertEqual(img, (mime, data))
 
+    def test_resolve_and_play_passes_artist_in_track_mode(self):
+        server = load_server()
+        with mock.patch.object(server, "resolve") as mock_resolve, mock.patch.object(server, "play_resolution") as mock_play:
+            from music_resolver import Resolution
+            mock_resolve.return_value = Resolution("youtube", "url", "https://youtube.com/watch?v=123", "Silencio", "U2")
+            mock_play.return_value = {"ok": True}
+            payload = server.resolve_and_play("Silencio", "Living", server.LIBRARY, mode="track", artist="U2")
+            self.assertTrue(payload["ok"])
+            mock_resolve.assert_called_once_with(
+                "Silencio", "Living", None, False, None, False, artist="U2"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

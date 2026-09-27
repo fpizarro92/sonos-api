@@ -243,6 +243,65 @@ class MusicResolverTests(unittest.TestCase):
         self.assertEqual(len(cerati), 1)
         self.assertEqual(cerati[0]["title"], "Crimen")
 
+    def test_library_search_with_artist_filter(self):
+        index = LibraryIndex(self.db_path)
+        index.replace_tracks(
+            [
+                {"uri": "x-file-cifs://server/music/sanz.mp3", "title": "Silencio", "artist": "Alejandro Sanz", "album": "No Es Lo Mismo"},
+                {"uri": "x-file-cifs://server/music/u2-one.mp3", "title": "One", "artist": "U2", "album": "Achtung Baby"},
+                {"uri": "x-file-cifs://server/music/metallica-one.mp3", "title": "One", "artist": "Metallica", "album": "...And Justice for All"},
+            ]
+        )
+
+        # Matching artist
+        sanz = index.search("Silencio", artist="Alejandro Sanz")
+        self.assertIsNotNone(sanz)
+        self.assertEqual(sanz["artist"], "Alejandro Sanz")
+
+        # Non-matching artist must return None
+        u2_silencio = index.search("Silencio", artist="U2")
+        self.assertIsNone(u2_silencio)
+
+        # Disambiguates identical titles by artist
+        u2_one = index.search("One", artist="U2")
+        self.assertIsNotNone(u2_one)
+        self.assertEqual(u2_one["artist"], "U2")
+
+        met_one = index.search("One", artist="Metallica")
+        self.assertIsNotNone(met_one)
+        self.assertEqual(met_one["artist"], "Metallica")
+
+    def test_resolver_with_artist_filter_and_fallback(self):
+        from music_resolver import Resolver
+
+        library = LibraryIndex(self.db_path)
+        library.replace_tracks(
+            [
+                {"uri": "x-file-cifs://server/music/sanz.mp3", "title": "Silencio", "artist": "Alejandro Sanz", "album": "Album"},
+            ]
+        )
+        called_yt = []
+        def mock_yt(q):
+            called_yt.append(q)
+            return Resolution("youtube", "url", f"https://www.youtube.com/watch?v=mock_{q}", q, artist="U2")
+
+        resolver = Resolver(CacheStore(self.db_path), library, mock_yt)
+
+        # Auto mode with non-matching Samba artist should NOT return Samba, must fallback to YouTube with artist
+        res = resolver.resolve("Silencio", artist="U2", now=1_000)
+        self.assertEqual(res.provider, "youtube")
+        self.assertIn("Silencio U2", called_yt)
+
+        # Provider="samba" with non-matching artist must raise RuntimeError
+        with self.assertRaisesRegex(RuntimeError, "No local track found for: Silencio by U2"):
+            resolver.resolve("Silencio", artist="U2", provider="samba", bypass_cache=True, now=1_000)
+
+        # Matching artist in Samba returns Samba resolution
+        samba_res = resolver.resolve("Silencio", artist="Alejandro Sanz", now=1_000)
+        self.assertEqual(samba_res.provider, "samba")
+        self.assertEqual(samba_res.artist, "Alejandro Sanz")
+
 
 if __name__ == "__main__":
     unittest.main()
+

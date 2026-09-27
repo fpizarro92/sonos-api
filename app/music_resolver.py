@@ -29,6 +29,29 @@ def _tokens(value: str) -> set[str]:
     return set(TOKEN_RE.findall(normalize_query(value)))
 
 
+def _artist_matches(target_artist: str, candidate_artist: str) -> bool:
+    norm_target = normalize_query(target_artist)
+    norm_cand = normalize_query(candidate_artist)
+    if not norm_target or not norm_cand:
+        return False
+    if norm_target == norm_cand:
+        return True
+    if norm_target in norm_cand or norm_cand in norm_target:
+        return True
+    t_clean = re.sub(r"^(the|los|las|el|la)\s+", "", norm_target).strip()
+    c_clean = re.sub(r"^(the|los|las|el|la)\s+", "", norm_cand).strip()
+    if t_clean and c_clean and (t_clean == c_clean or t_clean in c_clean or c_clean in t_clean):
+        return True
+    ratio = difflib.SequenceMatcher(None, norm_target, norm_cand).ratio()
+    if ratio >= 0.78:
+        return True
+    if t_clean and c_clean:
+        clean_ratio = difflib.SequenceMatcher(None, t_clean, c_clean).ratio()
+        if clean_ratio >= 0.78:
+            return True
+    return False
+
+
 def parse_sonos_didl(didl: str) -> list[dict[str, str]]:
     if not didl.strip():
         return []
@@ -308,31 +331,55 @@ class LibraryIndex:
                 "INSERT INTO library_tracks_fts(rowid, title, artist, album, genre) SELECT rowid, title, artist, album, genre FROM library_tracks"
             )
 
-    def search_many(self, query: str, limit: int = 10) -> list[dict[str, str]]:
+    def search_many(self, query: str, limit: int = 10, artist: str | None = None) -> list[dict[str, str]]:
+        clean_artist = artist.strip() if artist else ""
         tokens = TOKEN_RE.findall(normalize_query(query))
         if not tokens:
             return []
         filtered_tokens = [t for t in tokens if t not in SPANISH_CARRIER_WORDS]
         if filtered_tokens:
             tokens = filtered_tokens
-        match_query = " AND ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
         wanted = set(tokens)
         candidate_limit = max(limit * 8, 100)
+
+        artist_tokens = [t for t in TOKEN_RE.findall(normalize_query(clean_artist)) if t not in SPANISH_CARRIER_WORDS] if clean_artist else []
+        combined_tokens = list(tokens) + [t for t in artist_tokens if t not in tokens]
+
+        rows = []
         with self.database.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT library_tracks.uri, library_tracks.title, library_tracks.artist, library_tracks.album, library_tracks.genre, library_tracks.year
-                FROM library_tracks_fts
-                JOIN library_tracks ON library_tracks.rowid = library_tracks_fts.rowid
-                WHERE library_tracks_fts MATCH ?
-                ORDER BY bm25(library_tracks_fts, 3.0, 2.0, 1.0, 1.5)
-                LIMIT ?
-                """,
-                (match_query, candidate_limit),
-            ).fetchall()
+            if clean_artist and artist_tokens:
+                match_combined = " AND ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in combined_tokens)
+                rows = connection.execute(
+                    """
+                    SELECT library_tracks.uri, library_tracks.title, library_tracks.artist, library_tracks.album, library_tracks.genre, library_tracks.year
+                    FROM library_tracks_fts
+                    JOIN library_tracks ON library_tracks.rowid = library_tracks_fts.rowid
+                    WHERE library_tracks_fts MATCH ?
+                    ORDER BY bm25(library_tracks_fts, 3.0, 2.0, 1.0, 1.5)
+                    LIMIT ?
+                    """,
+                    (match_combined, candidate_limit),
+                ).fetchall()
+
+            if not rows:
+                match_query = " AND ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+                rows = connection.execute(
+                    """
+                    SELECT library_tracks.uri, library_tracks.title, library_tracks.artist, library_tracks.album, library_tracks.genre, library_tracks.year
+                    FROM library_tracks_fts
+                    JOIN library_tracks ON library_tracks.rowid = library_tracks_fts.rowid
+                    WHERE library_tracks_fts MATCH ?
+                    ORDER BY bm25(library_tracks_fts, 3.0, 2.0, 1.0, 1.5)
+                    LIMIT ?
+                    """,
+                    (match_query, candidate_limit),
+                ).fetchall()
+
         ranked: list[tuple[int, sqlite3.Row]] = []
         normalized_query = normalize_query(query)
         for row in rows:
+            if clean_artist and not _artist_matches(clean_artist, row["artist"]):
+                continue
             score = (
                 len(wanted & _tokens(row["title"])) * 3
                 + len(wanted & _tokens(row["artist"])) * 2
@@ -349,7 +396,7 @@ class LibraryIndex:
 
         # --- Typo tolerance / Fuzzy rescue ---
         raw_tokens = [t for t in tokens if t not in SPANISH_CARRIER_WORDS]
-        if raw_tokens:
+        if raw_tokens and not clean_artist:
             artists = self._get_artists()
             if artists:
                 norm_art_map = {normalize_query(a): a for a in artists}
@@ -370,14 +417,14 @@ class LibraryIndex:
                     if corrected_query != query:
                         break
                 if corrected_query != query:
-                    fuzzy_results = self.search_many(corrected_query, limit=limit)
+                    fuzzy_results = self.search_many(corrected_query, limit=limit, artist=clean_artist or None)
                     if fuzzy_results:
                         return fuzzy_results
 
         titles = self._get_titles()
         if titles:
             norm_title_map = {normalize_query(t): t for t in titles}
-            title_matches = difflib.get_close_matches(normalized_query, norm_title_map.keys(), n=limit, cutoff=0.68)
+            title_matches = difflib.get_close_matches(normalized_query, norm_title_map.keys(), n=candidate_limit if clean_artist else limit, cutoff=0.68)
             if title_matches:
                 matched_titles = [norm_title_map[tm] for tm in title_matches]
                 placeholders = ", ".join("?" for _ in matched_titles)
@@ -389,10 +436,13 @@ class LibraryIndex:
                         WHERE title IN ({placeholders})
                         LIMIT ?
                         """,
-                        [*matched_titles, limit],
+                        [*matched_titles, candidate_limit if clean_artist else limit],
                     ).fetchall()
                 if fuzzy_rows:
-                    return [dict(r) for r in fuzzy_rows]
+                    if clean_artist:
+                        fuzzy_rows = [r for r in fuzzy_rows if _artist_matches(clean_artist, r["artist"])]
+                    if fuzzy_rows:
+                        return [dict(r) for r in fuzzy_rows[:limit]]
 
         return []
 
@@ -614,15 +664,16 @@ class LibraryIndex:
         with self.database.connect() as connection:
             return int(connection.execute("SELECT COUNT(*) FROM library_tracks").fetchone()[0])
 
-    def search(self, query: str) -> dict[str, str] | None:
-        matches = self.search_many(query, limit=1)
+    def search(self, query: str, artist: str | None = None) -> dict[str, str] | None:
+        matches = self.search_many(query, limit=1, artist=artist)
         if matches:
             return matches[0]
-        p_genre, p_decade = parse_genre_and_decade(query)
-        if p_genre or p_decade:
-            genre_matches = self.search_genre(genre=p_genre, decade=p_decade, limit=1, shuffle=True)
-            if genre_matches:
-                return genre_matches[0]
+        if not artist:
+            p_genre, p_decade = parse_genre_and_decade(query)
+            if p_genre or p_decade:
+                genre_matches = self.search_genre(genre=p_genre, decade=p_decade, limit=1, shuffle=True)
+                if genre_matches:
+                    return genre_matches[0]
         return None
 
 
@@ -735,33 +786,43 @@ class Resolver:
         provider: str | None = None,
         bypass_cache: bool = False,
         now: int | None = None,
+        artist: str | None = None,
     ) -> Resolution:
         normalized = normalize_query(query)
         if not normalized:
             raise ValueError("query is required")
+        clean_artist = artist.strip() if artist else None
+        cache_key = f"{normalized}::artist::{normalize_query(clean_artist)}" if clean_artist and normalize_query(clean_artist) else normalized
         cache_provider = provider if provider in {"samba", "youtube", "youtube_music"} else None
-        cached = None if bypass_cache else self.cache.get(normalized, now=now, provider=cache_provider)
+        cached = None if bypass_cache else self.cache.get(cache_key, now=now, provider=cache_provider)
         if cached is not None:
             return cached
         if provider == "youtube":
-            resolution = self.youtube_search(normalized)
-            self.cache.put(normalized, resolution, ttl_seconds=7 * 24 * 60 * 60, now=now)
+            yt_query = f"{query} {clean_artist}".strip() if clean_artist else normalized
+            resolution = self.youtube_search(yt_query)
+            self.cache.put(cache_key, resolution, ttl_seconds=7 * 24 * 60 * 60, now=now)
             return resolution
         if provider not in {None, "samba", "youtube_music"}:
             raise ValueError("provider must be samba, youtube, or youtube_music")
-        local = None if provider == "youtube_music" else self.library.search(normalized)
+        local = None if provider == "youtube_music" else self.library.search(normalized, artist=clean_artist)
         if local is not None:
             resolution = Resolution("samba", "uri", local["uri"], local["title"], local["artist"], local["album"])
-            self.cache.put(normalized, resolution, ttl_seconds=90 * 24 * 60 * 60, now=now)
+            self.cache.put(cache_key, resolution, ttl_seconds=90 * 24 * 60 * 60, now=now)
             return resolution
+        if provider == "samba":
+            msg = f"No local track found for: {query}"
+            if clean_artist:
+                msg += f" by {clean_artist}"
+            raise RuntimeError(msg)
         if youtube_music_url:
             parsed = urlparse(youtube_music_url)
             host = (parsed.hostname or "").lower()
             if parsed.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
                 raise ValueError("youtube_music_url must be an HTTPS YouTube or YouTube Music URL")
             resolution = Resolution("youtube_music", "url", youtube_music_url, normalized)
-            self.cache.put(normalized, resolution, ttl_seconds=14 * 24 * 60 * 60, now=now)
+            self.cache.put(cache_key, resolution, ttl_seconds=14 * 24 * 60 * 60, now=now)
             return resolution
-        resolution = self.youtube_search(normalized)
-        self.cache.put(normalized, resolution, ttl_seconds=7 * 24 * 60 * 60, now=now)
+        yt_query = f"{query} {clean_artist}".strip() if clean_artist else normalized
+        resolution = self.youtube_search(yt_query)
+        self.cache.put(cache_key, resolution, ttl_seconds=7 * 24 * 60 * 60, now=now)
         return resolution
