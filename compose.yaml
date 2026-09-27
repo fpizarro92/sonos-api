@@ -1,0 +1,25 @@
+services:
+  sonos-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local/sonos-api:project-2026-09-27
+    container_name: sonos-api
+    network_mode: host
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    volumes:
+      - sonos-api-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:39100/health', timeout=3).read()"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 90s
+volumes:
+  sonos-api-data:
