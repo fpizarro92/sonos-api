@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.1](https://github.com/fpizarro92/sonos-api/compare/v2.4.0...v2.4.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* persist youtube stream tokens in sqlite and delegate mcp to http api ([b06a078](https://github.com/fpizarro92/sonos-api/commit/b06a07843e95706098a97e2fa7b351e7d94ed884))
+
 ## [2.4.0](https://github.com/fpizarro92/sonos-api/compare/v2.3.0...v2.4.0) (2026-09-28)
 
 
