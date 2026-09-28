@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.3.0](https://github.com/fpizarro92/sonos-api/compare/v2.2.0...v2.3.0) (2026-09-28)
+
+
+### Features
+
+* auto-detect youtube playlist urls and resolve tracks across all modes ([e7a6427](https://github.com/fpizarro92/sonos-api/commit/e7a64270409ed626d65ecd5e31aa66f41564d076))
+
+
+### Bug Fixes
+
+* prevent yt-dlp timeout on youtube music album and artist resolution ([d6ca0cf](https://github.com/fpizarro92/sonos-api/commit/d6ca0cf710525b46c0b1d7ee537bad7f4cfde726))
+
 ## [2.2.0](https://github.com/fpizarro92/sonos-api/compare/v2.1.0...v2.2.0) (2026-09-27)
 
 
