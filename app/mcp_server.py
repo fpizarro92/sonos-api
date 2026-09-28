@@ -433,10 +433,28 @@ def enrich_playback_payload(
 
 
 class DefaultBackend:
-    """Backend por defecto que invoca las funciones del núcleo de server.py."""
+    """Backend por defecto que invoca las funciones del núcleo de server.py o delega a la API HTTP local."""
 
     def _server(self):
         return _load_server()
+
+    def _call_http_api(self, endpoint: str, data: dict, timeout: int = 120) -> Optional[dict]:
+        """Delega la petición al daemon HTTP local si está activo en 127.0.0.1:39100."""
+        try:
+            import urllib.request
+            url = f"http://127.0.0.1:39100{endpoint}"
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            pass
+        return None
 
     def get_room(self, room: Optional[str] = None) -> str:
         if room and room.strip():
@@ -462,9 +480,29 @@ class DefaultBackend:
         limit: int = 10,
         bypass_cache: bool = False,
     ) -> Dict[str, Any]:
-        srv = self._server()
         target_room = self.get_room(room)
         provider_val = provider.strip().lower() if provider and provider.strip().lower() != "auto" else None
+
+        # Delegar al daemon HTTP local si está corriendo (mismo espacio de memoria de streams)
+        http_data = {
+            "query": query,
+            "room": target_room,
+            "mode": mode,
+            "artist": artist or "",
+            "album": album,
+            "live": live,
+            "genre": genre,
+            "decade": decade,
+            "shuffle": shuffle,
+            "provider": provider_val,
+            "limit": limit or 10,
+            "bypass_cache": bypass_cache,
+        }
+        api_res = self._call_http_api("/resolve-and-play", http_data)
+        if api_res is not None:
+            return enrich_playback_payload(api_res, target_room, server_module=self._server())
+
+        srv = self._server()
         resolved = srv.resolve_and_play(
             query=query,
             room=target_room,

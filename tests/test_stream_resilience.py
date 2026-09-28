@@ -267,6 +267,54 @@ class StreamResilienceTests(unittest.TestCase):
 
         self.assertNotIn("Living", self.server.ACTIVE_FEEDERS)
 
+    def test_save_youtube_stream_persists_across_memory_flush(self):
+        # 1. Save stream token in server
+        token = "persistent_token_123"
+        url = "https://www.youtube.com/watch?v=NUI9nqWX_EI"
+        self.server.save_youtube_stream(token, url)
+
+        # 2. Simulate complete RAM wipe (container restart / different process)
+        self.server.YOUTUBE_STREAMS.clear()
+        self.assertNotIn(token, self.server.YOUTUBE_STREAMS)
+
+        # 3. get_youtube_stream_source must recover it from SQLite
+        recovered_url = self.server.get_youtube_stream_source(token)
+        self.assertEqual(recovered_url, url)
+        self.assertIn(token, self.server.YOUTUBE_STREAMS)
+
+        # 4. HEAD request to stream endpoint must return 200 OK, not 404
+        class DummyHandler(self.server.Handler):
+            def __init__(self, path):
+                self.path = path
+                self.command = "HEAD"
+                self.headers = {}
+                self.rfile = io.BytesIO()
+                self.wfile = io.BytesIO()
+                self.sent_status = None
+                self.sent_headers = {}
+
+            def send_response(self, status, message=None):
+                self.sent_status = status
+
+            def send_header(self, key, value):
+                self.sent_headers[key] = value
+
+            def end_headers(self):
+                pass
+
+            def send_error(self, code, message=None, explain=None):
+                self.sent_status = code
+
+            def log_message(self, format, *args):
+                pass
+
+        # Clear RAM again before HEAD request
+        self.server.YOUTUBE_STREAMS.clear()
+        handler = DummyHandler(f"/stream/youtube/{token}")
+        handler.do_HEAD()
+        self.assertEqual(handler.sent_status, 200)
+        self.assertEqual(handler.sent_headers.get("Content-Type"), "audio/mpeg")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -86,6 +87,52 @@ IMAGE_SOURCES: dict[str, str] = {}
 DATA_DIR = Path("/data")
 DATABASE_PATH = DATA_DIR / "music-cache.sqlite"
 LIBRARY_STATUS_PATH = DATA_DIR / "library-sync.json"
+
+
+def init_stream_tokens_db() -> None:
+    try:
+        DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(DATABASE_PATH, timeout=5) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS youtube_streams ("
+                "token TEXT PRIMARY KEY, url TEXT, created_at REAL"
+                ")"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_youtube_streams_created ON youtube_streams(created_at)")
+    except Exception as e:
+        logger.debug("Failed to init youtube_streams table: %s", e)
+
+
+def save_youtube_stream(token: str, url: str) -> None:
+    if len(YOUTUBE_STREAMS) >= MAX_ACTIVE_STREAMS:
+        oldest_key = next(iter(YOUTUBE_STREAMS))
+        YOUTUBE_STREAMS.pop(oldest_key, None)
+    YOUTUBE_STREAMS[token] = url
+    try:
+        init_stream_tokens_db()
+        with sqlite3.connect(DATABASE_PATH, timeout=5) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO youtube_streams (token, url, created_at) VALUES (?, ?, ?)",
+                (token, url, time.time()),
+            )
+    except Exception as e:
+        logger.debug("Failed to persist stream token %s: %s", token, e)
+
+
+def get_youtube_stream_source(token: str) -> str | None:
+    if token in YOUTUBE_STREAMS:
+        return YOUTUBE_STREAMS[token]
+    try:
+        if DATABASE_PATH.exists():
+            with sqlite3.connect(DATABASE_PATH, timeout=5) as conn:
+                row = conn.execute("SELECT url FROM youtube_streams WHERE token = ?", (token,)).fetchone()
+                if row and row[0]:
+                    url = str(row[0])
+                    YOUTUBE_STREAMS[token] = url
+                    return url
+    except Exception as e:
+        logger.debug("Failed to read stream token %s from db: %s", token, e)
+    return None
 MAX_QUERY_LENGTH = 180
 MAX_LIBRARY_TRACKS = 50_000
 LIBRARY_PAGE_SIZE = 500
@@ -772,10 +819,7 @@ def append_tracks_to_queue(room: str, tracks: list[dict[str, str]]) -> int:
     for track in tracks:
         token = uuid.uuid4().hex
         cleaned_url = clean_youtube_url(track["url"])
-        if len(YOUTUBE_STREAMS) >= MAX_ACTIVE_STREAMS:
-            oldest_key = next(iter(YOUTUBE_STREAMS))
-            YOUTUBE_STREAMS.pop(oldest_key, None)
-        YOUTUBE_STREAMS[token] = cleaned_url
+        save_youtube_stream(token, cleaned_url)
         uri = f"http://{public_host}:{BIND_PORT}/stream/youtube/{token}"
         track_item = {**track, "url": cleaned_url, "uri": uri, "protocol": "http-get"}
         args = (
@@ -889,10 +933,7 @@ def play_youtube_list(room: str, tracks: list[dict[str, str]], max_queue: int = 
     for track in tracks:
         token = uuid.uuid4().hex
         cleaned_url = clean_youtube_url(track["url"])
-        if len(YOUTUBE_STREAMS) >= MAX_ACTIVE_STREAMS:
-            oldest_key = next(iter(YOUTUBE_STREAMS))
-            YOUTUBE_STREAMS.pop(oldest_key, None)
-        YOUTUBE_STREAMS[token] = cleaned_url
+        save_youtube_stream(token, cleaned_url)
         queued.append({**track, "url": cleaned_url, "uri": f"http://{public_host}:{BIND_PORT}/stream/youtube/{token}", "protocol": "http-get"})
 
     # Pre-warm stream for the first track so Sonos gets audio immediately without timeout
@@ -1548,7 +1589,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/stream/youtube/"):
             token = parsed.path.rsplit("/", 1)[-1]
-            if token not in YOUTUBE_STREAMS:
+            if not get_youtube_stream_source(token):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             self.send_response(HTTPStatus.OK)
@@ -1605,7 +1646,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/stream/youtube/"):
             token = parsed.path.rsplit("/", 1)[-1]
-            source_url = YOUTUBE_STREAMS.get(token)
+            source_url = get_youtube_stream_source(token)
             if not source_url:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
