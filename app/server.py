@@ -13,7 +13,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +28,7 @@ from music_resolver import (
     Resolution,
     Resolver,
     clean_youtube_url,
+    extract_youtube_video_id,
     is_live_track,
     is_youtube_playlist_url,
     normalize_query,
@@ -188,9 +189,13 @@ def search_youtube_many(query: str, limit: int) -> list[dict[str, str]]:
     return tracks
 
 
-def youtube_json(url: str, timeout: int = 90) -> dict:
+def youtube_json(url: str, timeout: int = 90, max_items: int = 20) -> dict:
+    cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json"]
+    if max_items:
+        cmd.extend(["--playlist-end", str(max_items)])
+    cmd.append(url)
     completed = subprocess.run(
-        ["yt-dlp", "--flat-playlist", "--dump-single-json", url],
+        cmd,
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
     )
     if completed.returncode != 0:
@@ -638,19 +643,31 @@ def play_local_list(room: str, tracks: list[dict[str, str]]) -> None:
     udn = next(item["udn"] for item in json.loads(device) if item.get("name") == room)
     avtransport = "urn:schemas-upnp-org:service:AVTransport:1"
     soap_action(ip, avtransport, "RemoveAllTracksFromQueue", "<InstanceID>0</InstanceID>")
-    for track in tracks:
+
+    # Pre-enqueue track 1 and start playing immediately for fast Time-to-First-Audio
+    first = tracks[0]
+    first_args = (
+        "<InstanceID>0</InstanceID><EnqueuedURI>" + escape(first["uri"]) + "</EnqueuedURI>"
+        "<EnqueuedURIMetaData>" + escape(local_track_metadata(first)) + "</EnqueuedURIMetaData>"
+        "<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>"
+    )
+    soap_action(ip, avtransport, "AddURIToQueue", first_args)
+    queue_uri = f"x-rincon-queue:{udn}#0"
+    soap_action(ip, avtransport, "SetAVTransportURI", f"<InstanceID>0</InstanceID><CurrentURI>{escape(queue_uri)}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+    soap_action(ip, avtransport, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+    # Append remaining tracks to the queue while playback of track 1 has already started
+    for track in tracks[1:]:
         args = (
             "<InstanceID>0</InstanceID><EnqueuedURI>" + escape(track["uri"]) + "</EnqueuedURI>"
             "<EnqueuedURIMetaData>" + escape(local_track_metadata(track)) + "</EnqueuedURIMetaData>"
             "<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>"
         )
         soap_action(ip, avtransport, "AddURIToQueue", args)
-    queue_uri = f"x-rincon-queue:{udn}#0"
-    soap_action(ip, avtransport, "SetAVTransportURI", f"<InstanceID>0</InstanceID><CurrentURI>{escape(queue_uri)}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
-    soap_action(ip, avtransport, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 
 
 def stop_playback(room: str) -> dict:
+    stop_queue_feeder(room)
     try:
         return run_sonos("stop", "--name", room)
     except Exception:
@@ -681,7 +698,191 @@ def previous_track(room: str) -> dict:
 
 
 
-def play_youtube_list(room: str, tracks: list[dict[str, str]]) -> list[dict[str, str]]:
+class QueueFeeder:
+    def __init__(
+        self,
+        room: str,
+        source_url: str,
+        next_start: int = 21,
+        batch_size: int = 15,
+        active: bool = True,
+        last_feed_time: float = 0.0,
+    ):
+        self.room = room
+        self.source_url = source_url
+        self.next_start = next_start
+        self.batch_size = batch_size
+        self.active = active
+        self.last_feed_time = last_feed_time
+
+
+ACTIVE_FEEDERS: dict[str, QueueFeeder] = {}
+FEEDER_THREAD: threading.Thread | None = None
+FEEDER_LOCK = threading.Lock()
+
+
+def register_queue_feeder(room: str, source_url: str, next_start: int = 21, batch_size: int = 15) -> None:
+    with FEEDER_LOCK:
+        ACTIVE_FEEDERS[room] = QueueFeeder(
+            room=room,
+            source_url=source_url,
+            next_start=next_start,
+            batch_size=batch_size,
+            active=True,
+            last_feed_time=0.0,
+        )
+        _ensure_feeder_thread_started()
+    logger.info("Registered queue feeder for room '%s' (source=%s, next_start=%d)", room, source_url, next_start)
+
+
+def stop_queue_feeder(room: str) -> None:
+    with FEEDER_LOCK:
+        feeder = ACTIVE_FEEDERS.pop(room, None)
+        if feeder:
+            feeder.active = False
+            logger.info("Stopped queue feeder for room '%s'", room)
+
+
+def get_queue_position(room: str) -> tuple[int, int]:
+    """Returns (current_track_number, total_tracks_in_queue). Returns (0, 0) on failure."""
+    try:
+        ip = discover_room(room)
+        avtransport = "urn:schemas-upnp-org:service:AVTransport:1"
+        pos_xml = soap_action(ip, avtransport, "GetPositionInfo", "<InstanceID>0</InstanceID>")
+        pos_match = re.search(r"<Track>(\\d+)</Track>", pos_xml)
+        current_track = int(pos_match.group(1)) if pos_match else 0
+
+        media_xml = soap_action(ip, avtransport, "GetMediaInfo", "<InstanceID>0</InstanceID>")
+        media_match = re.search(r"<NrTracks>(\\d+)</NrTracks>", media_xml)
+        total_tracks = int(media_match.group(1)) if media_match else 0
+
+        return current_track, total_tracks
+    except Exception:
+        return (0, 0)
+
+
+def append_tracks_to_queue(room: str, tracks: list[dict[str, str]]) -> int:
+    """Appends tracks to the end of the Sonos room's current queue without interrupting playback."""
+    if not tracks:
+        return 0
+    speaker_ip = discover_room(room)
+    public_host = resolve_public_host(speaker_ip)
+    avtransport = "urn:schemas-upnp-org:service:AVTransport:1"
+    added = 0
+    for track in tracks:
+        token = uuid.uuid4().hex
+        cleaned_url = clean_youtube_url(track["url"])
+        if len(YOUTUBE_STREAMS) >= MAX_ACTIVE_STREAMS:
+            oldest_key = next(iter(YOUTUBE_STREAMS))
+            YOUTUBE_STREAMS.pop(oldest_key, None)
+        YOUTUBE_STREAMS[token] = cleaned_url
+        uri = f"http://{public_host}:{BIND_PORT}/stream/youtube/{token}"
+        track_item = {**track, "url": cleaned_url, "uri": uri, "protocol": "http-get"}
+        args = (
+            "<InstanceID>0</InstanceID><EnqueuedURI>" + escape(uri) + "</EnqueuedURI>"
+            "<EnqueuedURIMetaData>" + escape(local_track_metadata(track_item)) + "</EnqueuedURIMetaData>"
+            "<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>"
+        )
+        soap_action(speaker_ip, avtransport, "AddURIToQueue", args)
+        added += 1
+    return added
+
+
+def fetch_playlist_batch(url: str, start_index: int, count: int) -> list[dict[str, str]]:
+    """Fetch a slice of tracks from a playlist or radio URL using yt-dlp."""
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--dump-single-json",
+        "--playlist-start", str(start_index),
+        "--playlist-end", str(start_index + count - 1),
+        url,
+    ]
+    completed = subprocess.run(
+        cmd,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False,
+    )
+    if completed.returncode != 0:
+        logger.warning("Feeder yt-dlp fetch failed for %s: %s", url, completed.stderr.strip()[:200])
+        return []
+    try:
+        payload = json.loads(completed.stdout)
+    except Exception:
+        return []
+
+    tracks = []
+    title = str(payload.get("title") or "Playlist").strip()
+    for entry in payload.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        watch_url = youtube_watch_url(entry)
+        track_title = str(entry.get("title") or "").strip()
+        if not watch_url or not track_title:
+            continue
+        tracks.append({
+            "url": watch_url,
+            "title": track_title,
+            "artist": str(entry.get("channel") or entry.get("uploader") or "").strip(),
+            "album": title,
+        })
+    return tracks
+
+
+def feed_queue_if_needed(room: str) -> None:
+    feeder = ACTIVE_FEEDERS.get(room)
+    if not feeder or not feeder.active:
+        return
+
+    state = get_transport_state(room)
+    if state not in {"PLAYING", "TRANSITIONING", "PAUSED_PLAYBACK"}:
+        return
+
+    current_track, total_tracks = get_queue_position(room)
+    if total_tracks == 0:
+        return
+
+    if (total_tracks - current_track) <= 3:
+        now = time.time()
+        if now - feeder.last_feed_time < 5.0:
+            return
+        feeder.last_feed_time = now
+
+        logger.info(
+            "Feeder: room '%s' is on track %d of %d; fetching next batch starting at %d...",
+            room, current_track, total_tracks, feeder.next_start,
+        )
+        new_tracks = fetch_playlist_batch(feeder.source_url, feeder.next_start, feeder.batch_size)
+        if not new_tracks:
+            logger.info("Feeder: no more tracks returned for room '%s'; marking feeder finished", room)
+            feeder.active = False
+            return
+        added = append_tracks_to_queue(room, new_tracks)
+        feeder.next_start += len(new_tracks)
+        logger.info("Feeder: added %d new tracks to room '%s' (next_start=%d)", added, room, feeder.next_start)
+
+
+def _feeder_background_loop() -> None:
+    while True:
+        try:
+            rooms = list(ACTIVE_FEEDERS.keys())
+            for room in rooms:
+                feed_queue_if_needed(room)
+        except Exception as error:
+            logger.debug("Feeder loop error: %s", error)
+        time.sleep(10)
+
+
+def _ensure_feeder_thread_started() -> None:
+    global FEEDER_THREAD
+    if FEEDER_THREAD is None or not FEEDER_THREAD.is_alive():
+        FEEDER_THREAD = threading.Thread(target=_feeder_background_loop, daemon=True, name="QueueFeeder")
+        FEEDER_THREAD.start()
+
+
+def play_youtube_list(room: str, tracks: list[dict[str, str]], max_queue: int = 20, source_url: str | None = None) -> list[dict[str, str]]:
+    if max_queue and len(tracks) > max_queue:
+        logger.info("Truncating playlist to first %d tracks (was %d)", max_queue, len(tracks))
+        tracks = tracks[:max_queue]
     speaker_ip = discover_room(room)
     public_host = resolve_public_host(speaker_ip)
     queued = []
@@ -712,6 +913,9 @@ def play_youtube_list(room: str, tracks: list[dict[str, str]]) -> list[dict[str,
             wait_for_playback_state(room, target_states={"PLAYING"}, timeout=3.0, poll_interval=0.2)
         except Exception as error:
             logger.warning("Retry play failed: %s", error)
+
+    if source_url:
+        register_queue_feeder(room, source_url, next_start=len(queued) + 1, batch_size=15)
 
     return queued
 
@@ -1048,7 +1252,7 @@ def resolve_and_play(
             "tracks": tracks,
         }
         if action == "play":
-            payload["result"] = {"queued": len(play_youtube_list(room, tracks))}
+            payload["result"] = {"queued": len(play_youtube_list(room, tracks, max_queue=20, source_url=query))}
         return payload
 
     # 1. Mode: Artist
@@ -1249,7 +1453,7 @@ def resolve_and_play(
                 tracks = search_youtube_many(yt_query, limit)
             if not tracks:
                 raise RuntimeError("No YouTube tracks found for the list")
-            resolved_tracks = play_youtube_list(room, tracks) if action == "play" else tracks
+            resolved_tracks = play_youtube_list(room, tracks, max_queue=20, source_url=query if is_url else None) if action == "play" else tracks
             payload = {"ok": True, "provider": "youtube", "count": len(tracks), "tracks": tracks}
             if resolved_tracks is not tracks:
                 payload["result"] = {"queued": len(resolved_tracks)}
@@ -1289,7 +1493,8 @@ def resolve_and_play(
 
     # 5. Mode: Track (default)
     if is_url:
-        resolution = Resolution("youtube", "url", query, "YouTube Track")
+        clean_url = clean_youtube_url(query)
+        resolution = Resolution("youtube", "url", clean_url, "YouTube Track")
         payload = {"ok": True, "resolution": asdict(resolution)}
         if action == "play":
             payload["result"] = play_resolution(room, resolution)

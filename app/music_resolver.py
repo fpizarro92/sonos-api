@@ -17,8 +17,26 @@ SPANISH_CARRIER_WORDS = {"pon", "reproduce", "cancion", "canciones", "tema", "te
 ALLOWED_MEDIA_HOSTS = {"youtube.com", "www.youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be"}
 
 
+def extract_youtube_video_id(url: str | None) -> str | None:
+    """Extrae el ID de video de cualquier URL de YouTube o YouTube Music."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    patterns = [
+        r"(?:v=|vi=|v%3D|vi%3D)([a-zA-Z0-9_-]{6,20})",
+        r"youtu\.be/([a-zA-Z0-9_-]{6,20})",
+        r"youtube\.com/embed/([a-zA-Z0-9_-]{6,20})",
+        r"youtube\.com/shorts/([a-zA-Z0-9_-]{6,20})",
+        r"youtube\.com/live/([a-zA-Z0-9_-]{6,20})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, str(url))
+        if match:
+            return match.group(1)
+    return None
+
+
 def clean_youtube_url(url: str) -> str:
-    """Normalize YouTube and YouTube Music URLs to canonical https://www.youtube.com/watch?v=ID."""
+    """Normalize YouTube and YouTube Music URLs to canonical https://www.youtube.com/watch?v=ID or playlist."""
     if not isinstance(url, str) or not url.strip():
         return url
     url = url.strip()
@@ -26,30 +44,18 @@ def clean_youtube_url(url: str) -> str:
     host = (parsed.hostname or "").lower()
     if host not in ALLOWED_MEDIA_HOSTS:
         return url
-    qs = parse_qs(parsed.query)
 
-    # 1. /watch?v=VIDEO_ID
-    if "v" in qs and qs["v"] and re.fullmatch(r"[A-Za-z0-9_-]{6,20}", qs["v"][0]):
-        vid = qs["v"][0]
-        if "list" in qs and qs["list"] and re.fullmatch(r"[A-Za-z0-9_-]+", qs["list"][0]):
-            return f"https://www.youtube.com/watch?v={vid}&list={qs['list'][0]}"
+    # 1. Any URL containing a video ID canonicalizes to single-track watch URL.
+    # This strips tracking parameters AND drops &list=... (e.g. &list=RD...)
+    # ensuring single-track playback requests only resolve that specific track.
+    vid = extract_youtube_video_id(url)
+    if vid:
         return f"https://www.youtube.com/watch?v={vid}"
 
-    # 2. youtu.be/VIDEO_ID
-    if host == "youtu.be":
-        vid = parsed.path.strip("/").split("/")[0]
-        if re.fullmatch(r"[A-Za-z0-9_-]{6,20}", vid):
-            return f"https://www.youtube.com/watch?v={vid}"
+    qs = parse_qs(parsed.query)
 
-    # 3. /shorts/VIDEO_ID, /embed/VIDEO_ID, /v/VIDEO_ID
-    for prefix in ("/shorts/", "/embed/", "/v/"):
-        if parsed.path.startswith(prefix):
-            vid = parsed.path[len(prefix):].split("/")[0]
-            if re.fullmatch(r"[A-Za-z0-9_-]{6,20}", vid):
-                return f"https://www.youtube.com/watch?v={vid}"
-
-    # 4. /playlist?list=PLAYLIST_ID
-    if parsed.path.startswith("/playlist") and "list" in qs and qs["list"]:
+    # 2. Dedicated playlist: /playlist?list=PLAYLIST_ID or pure playlist with list=
+    if "list" in qs and qs["list"]:
         lid = qs["list"][0]
         if re.fullmatch(r"[A-Za-z0-9_-]+", lid):
             return f"https://www.youtube.com/playlist?list={lid}"
@@ -66,6 +72,12 @@ def is_youtube_playlist_url(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in {"http", "https"} or host not in ALLOWED_MEDIA_HOSTS:
         return False
+
+    # If the URL contains an explicit video ID (e.g. watch?v=..., youtu.be/<id>?list=RD...),
+    # it is a track (which may belong to a mix/radio), NOT a dedicated playlist URL.
+    if extract_youtube_video_id(url):
+        return False
+
     qs = parse_qs(parsed.query)
 
     # 1. /playlist?list=...
@@ -76,8 +88,8 @@ def is_youtube_playlist_url(url: str) -> bool:
     if parsed.path.startswith("/browse/VL"):
         return True
 
-    # 3. Has "list=" and NO "v=" (pure playlist, e.g. music.youtube.com/?list=...)
-    if "list" in qs and qs["list"] and ("v" not in qs or not qs["v"]):
+    # 3. Has "list=" and NO video ID (pure playlist, e.g. music.youtube.com/?list=...)
+    if "list" in qs and qs["list"]:
         return True
 
     return False

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import io
 import sys
 import tempfile
@@ -59,12 +60,22 @@ class StreamResilienceTests(unittest.TestCase):
         cleaned = self.server.clean_youtube_url(url)
         self.assertEqual(cleaned, "https://www.youtube.com/playlist?list=OLAK5uy_abc123")
 
+    def test_clean_youtube_url_with_mix_radio_strips_list(self):
+        # Shortlink with algorithmic radio/mix
+        short_url = "https://youtu.be/NUI9nqWX_EI?list=RDNUI9nqWX_EI"
+        self.assertEqual(self.server.clean_youtube_url(short_url), "https://www.youtube.com/watch?v=NUI9nqWX_EI")
+
+        # Full watch URL with algorithmic radio/mix
+        full_url = "https://www.youtube.com/watch?v=NUI9nqWX_EI&list=RDNUI9nqWX_EI"
+        self.assertEqual(self.server.clean_youtube_url(full_url), "https://www.youtube.com/watch?v=NUI9nqWX_EI")
+
     def test_is_youtube_playlist_url_detection(self):
         self.assertTrue(self.server.is_youtube_playlist_url("https://www.youtube.com/playlist?list=PL12345678"))
         self.assertTrue(self.server.is_youtube_playlist_url("https://music.youtube.com/playlist?list=OLAK5uy_abc"))
         self.assertTrue(self.server.is_youtube_playlist_url("https://music.youtube.com/browse/VL-playlist-id"))
         self.assertFalse(self.server.is_youtube_playlist_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
         self.assertFalse(self.server.is_youtube_playlist_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL12345678"))
+        self.assertFalse(self.server.is_youtube_playlist_url("https://youtu.be/NUI9nqWX_EI?list=RDNUI9nqWX_EI"))
         self.assertFalse(self.server.is_youtube_playlist_url("pearl jam no code"))
         self.assertFalse(self.server.is_youtube_playlist_url(""))
 
@@ -173,6 +184,88 @@ class StreamResilienceTests(unittest.TestCase):
         handler_404 = DummyHandler("/stream/youtube/non_existent_token")
         handler_404.do_HEAD()
         self.assertEqual(handler_404.sent_status, 404)
+
+    def test_youtube_json_applies_playlist_end_flag(self):
+        fake_completed = mock.Mock(returncode=0, stdout='{"entries": []}', stderr="")
+        with mock.patch("subprocess.run", return_value=fake_completed) as mock_run:
+            self.server.youtube_json("https://www.youtube.com/playlist?list=PL123", max_items=25)
+            self.assertTrue(mock_run.called)
+            args = mock_run.call_args[0][0]
+            self.assertIn("--playlist-end", args)
+            self.assertEqual(args[args.index("--playlist-end") + 1], "25")
+
+    def test_play_youtube_list_truncation_preserves_tokens(self):
+        # Generate 1500 mock tracks (exceeding MAX_ACTIVE_STREAMS = 1000)
+        huge_tracks = [
+            {"url": f"https://www.youtube.com/watch?v=track{i:04d}", "title": f"Track {i}", "artist": "Artist", "album": "Album"}
+            for i in range(1500)
+        ]
+        with mock.patch.object(self.server, "discover_room", return_value="192.168.1.50"),              mock.patch.object(self.server, "resolve_public_host", return_value="192.168.1.10"),              mock.patch.object(self.server, "resolve_youtube_stream", return_value="http://stream"),              mock.patch.object(self.server, "play_local_list", return_value=None),              mock.patch.object(self.server, "wait_for_playback_state", return_value="PLAYING"):
+
+            self.server.YOUTUBE_STREAMS.clear()
+            queued = self.server.play_youtube_list("Living", huge_tracks, max_queue=20)
+
+            # Should be truncated to max_queue (20)
+            self.assertEqual(len(queued), 20)
+            # YOUTUBE_STREAMS should contain exactly 20 tokens, not overflow/evict
+            self.assertEqual(len(self.server.YOUTUBE_STREAMS), 20)
+            # Track 0 token must still be in YOUTUBE_STREAMS
+            first_token = queued[0]["uri"].split("/")[-1]
+            self.assertIn(first_token, self.server.YOUTUBE_STREAMS)
+
+    def test_play_local_list_starts_playback_on_first_track_before_rest(self):
+        mock_tracks = [
+            {"uri": f"http://test/{i}", "title": f"T{i}", "artist": "A", "album": "Alb"}
+            for i in range(3)
+        ]
+        calls = []
+        def mock_soap(ip, service, action, args):
+            calls.append((action, args))
+            return ""
+
+        with mock.patch.object(self.server, "discover_room", return_value="192.168.1.50"),              mock.patch.object(self.server, "run_sonos", return_value={"stdout": json.dumps([{"name": "Living", "udn": "RINCON_123"}])}),              mock.patch.object(self.server, "soap_action", side_effect=mock_soap):
+
+            self.server.play_local_list("Living", mock_tracks)
+
+            actions = [c[0] for c in calls]
+            # Order must be: RemoveAllTracksFromQueue, AddURIToQueue (track 0), SetAVTransportURI, Play, AddURIToQueue (tracks 1, 2)
+            self.assertEqual(actions[0], "RemoveAllTracksFromQueue")
+            self.assertEqual(actions[1], "AddURIToQueue")
+            self.assertIn("http://test/0", calls[1][1])
+            self.assertEqual(actions[2], "SetAVTransportURI")
+            self.assertEqual(actions[3], "Play")
+            self.assertEqual(actions[4], "AddURIToQueue")
+            self.assertIn("http://test/1", calls[4][1])
+            self.assertEqual(actions[5], "AddURIToQueue")
+            self.assertIn("http://test/2", calls[5][1])
+
+
+    def test_queue_feeder_appends_tracks_when_nearing_queue_end(self):
+        feeder_url = "https://www.youtube.com/playlist?list=PLinfinite"
+        self.server.register_queue_feeder("Living", feeder_url, next_start=21, batch_size=15)
+        feeder = self.server.ACTIVE_FEEDERS["Living"]
+
+        mock_new_tracks = [
+            {"url": f"https://www.youtube.com/watch?v=batch{i}", "title": f"Batch {i}", "artist": "Art", "album": "Alb"}
+            for i in range(15)
+        ]
+
+        with mock.patch.object(self.server, "get_transport_state", return_value="PLAYING"),              mock.patch.object(self.server, "get_queue_position", return_value=(18, 20)),              mock.patch.object(self.server, "fetch_playlist_batch", return_value=mock_new_tracks) as mock_fetch,              mock.patch.object(self.server, "append_tracks_to_queue", return_value=15) as mock_append:
+
+            self.server.feed_queue_if_needed("Living")
+
+            mock_fetch.assert_called_once_with(feeder_url, 21, 15)
+            mock_append.assert_called_once_with("Living", mock_new_tracks)
+            self.assertEqual(feeder.next_start, 36)
+
+    def test_stop_playback_stops_queue_feeder(self):
+        self.server.register_queue_feeder("Living", "https://youtube.com/playlist?list=PL123")
+        self.assertIn("Living", self.server.ACTIVE_FEEDERS)
+
+        with mock.patch.object(self.server, "run_sonos", return_value={"exit_code": 0}):
+            self.server.stop_playback("Living")
+
+        self.assertNotIn("Living", self.server.ACTIVE_FEEDERS)
 
 
 if __name__ == "__main__":
