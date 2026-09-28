@@ -525,8 +525,6 @@ def resolve_youtube_stream(url: str, force_fresh: bool = False) -> str:
             "--no-playlist",
             "-f",
             "bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio[ext=mp3]/bestaudio/best",
-            "--extract-flat",
-            "false",
             "-g",
             clean_url,
         ],
