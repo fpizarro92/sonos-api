@@ -323,8 +323,50 @@ class YouTubeAlbumResolutionTests(unittest.TestCase):
         finally:
             server.search_youtube_many = original_search_youtube_many
 
+    def test_auto_detects_playlist_url_in_track_and_list_mode(self):
+        server = load_server()
+        playlist_url = "https://www.youtube.com/playlist?list=PLtestplaylist"
+        mock_tracks = [
+            {"url": "https://www.youtube.com/watch?v=track01", "title": "Track 1", "artist": "Artist", "album": "Playlist Title"},
+            {"url": "https://www.youtube.com/watch?v=track02", "title": "Track 2", "artist": "Artist", "album": "Playlist Title"},
+        ]
+
+        original_resolve_youtube_album = server.resolve_youtube_album
+        try:
+            server.resolve_youtube_album = lambda q, a, bypass_cache=False: {
+                "album": "Playlist Title",
+                "artist": "Artist",
+                "tracks": mock_tracks,
+            }
+            # Test in mode='track' with action='resolve'
+            res_track = server.resolve_and_play(
+                query=playlist_url,
+                room="Living",
+                library=server.LIBRARY,
+                mode="track",
+                action="resolve",
+            )
+            self.assertTrue(res_track["ok"])
+            self.assertEqual(res_track["count"], 2)
+            self.assertEqual(res_track["album"], "Playlist Title")
+
+            # Test in mode='list' with action='resolve'
+            res_list = server.resolve_and_play(
+                query=playlist_url,
+                room="Living",
+                library=server.LIBRARY,
+                mode="list",
+                action="resolve",
+            )
+            self.assertTrue(res_list["ok"])
+            self.assertEqual(res_list["count"], 2)
+            self.assertEqual(res_list["album"], "Playlist Title")
+        finally:
+            server.resolve_youtube_album = original_resolve_youtube_album
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

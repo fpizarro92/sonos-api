@@ -29,6 +29,7 @@ from music_resolver import (
     Resolver,
     clean_youtube_url,
     is_live_track,
+    is_youtube_playlist_url,
     normalize_query,
     parse_genre_and_decade,
     parse_live_intent,
@@ -1031,6 +1032,24 @@ def resolve_and_play(
         mode, room, query, artist, genre, decade, provider or "auto"
     )
     is_url = is_youtube_url(query)
+    is_playlist = is_youtube_playlist_url(query)
+
+    # Dedicated YouTube playlist URL: auto-resolve and queue its tracks regardless of mode
+    if is_playlist and mode != "artist":
+        resolved_album = resolve_youtube_album(query, artist or "", bypass_cache=bypass_cache)
+        tracks = resolved_album["tracks"]
+        payload = {
+            "ok": True,
+            "provider": "youtube",
+            "mode": mode if mode in {"album", "list"} else "list",
+            "album": resolved_album["album"],
+            "artist": resolved_album["artist"],
+            "count": len(tracks),
+            "tracks": tracks,
+        }
+        if action == "play":
+            payload["result"] = {"queued": len(play_youtube_list(room, tracks))}
+        return payload
 
     # 1. Mode: Artist
     if mode == "artist":
@@ -1223,7 +1242,11 @@ def resolve_and_play(
         clean_artist = artist.strip() if artist else None
         yt_query = f"{query} {clean_artist}".strip() if clean_artist else query
         if provider in {"youtube", "youtube_music"} or is_url:
-            tracks = search_youtube_many(yt_query, limit)
+            if is_url:
+                resolved_album = resolve_youtube_album(query, clean_artist or "", bypass_cache=bypass_cache)
+                tracks = resolved_album["tracks"][:limit] if limit else resolved_album["tracks"]
+            else:
+                tracks = search_youtube_many(yt_query, limit)
             if not tracks:
                 raise RuntimeError("No YouTube tracks found for the list")
             resolved_tracks = play_youtube_list(room, tracks) if action == "play" else tracks
@@ -1245,7 +1268,11 @@ def resolve_and_play(
                 if clean_artist:
                     err_msg += f" by {clean_artist}"
                 raise RuntimeError(err_msg)
-            tracks = search_youtube_many(yt_query, limit)
+            if is_url:
+                resolved_album = resolve_youtube_album(query, clean_artist or "", bypass_cache=bypass_cache)
+                tracks = resolved_album["tracks"][:limit] if limit else resolved_album["tracks"]
+            else:
+                tracks = search_youtube_many(yt_query, limit)
             if not tracks:
                 raise RuntimeError("No YouTube tracks found for the list")
             resolved_tracks = play_youtube_list(room, tracks) if action == "play" else tracks

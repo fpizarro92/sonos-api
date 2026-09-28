@@ -57,6 +57,33 @@ def clean_youtube_url(url: str) -> str:
     return url
 
 
+def is_youtube_playlist_url(url: str) -> bool:
+    """Return True if url is a dedicated YouTube or YouTube Music playlist."""
+    if not isinstance(url, str) or not url.strip():
+        return False
+    url = url.strip()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or host not in ALLOWED_MEDIA_HOSTS:
+        return False
+    qs = parse_qs(parsed.query)
+
+    # 1. /playlist?list=...
+    if parsed.path.startswith("/playlist") and "list" in qs and qs["list"]:
+        return True
+
+    # 2. /browse/VL... (YouTube Music playlist browse path)
+    if parsed.path.startswith("/browse/VL"):
+        return True
+
+    # 3. Has "list=" and NO "v=" (pure playlist, e.g. music.youtube.com/?list=...)
+    if "list" in qs and qs["list"] and ("v" not in qs or not qs["v"]):
+        return True
+
+    return False
+
+
+
 def strip_accents(value: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", value) if unicodedata.category(c) != "Mn")
 

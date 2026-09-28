@@ -59,6 +59,15 @@ class StreamResilienceTests(unittest.TestCase):
         cleaned = self.server.clean_youtube_url(url)
         self.assertEqual(cleaned, "https://www.youtube.com/playlist?list=OLAK5uy_abc123")
 
+    def test_is_youtube_playlist_url_detection(self):
+        self.assertTrue(self.server.is_youtube_playlist_url("https://www.youtube.com/playlist?list=PL12345678"))
+        self.assertTrue(self.server.is_youtube_playlist_url("https://music.youtube.com/playlist?list=OLAK5uy_abc"))
+        self.assertTrue(self.server.is_youtube_playlist_url("https://music.youtube.com/browse/VL-playlist-id"))
+        self.assertFalse(self.server.is_youtube_playlist_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+        self.assertFalse(self.server.is_youtube_playlist_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL12345678"))
+        self.assertFalse(self.server.is_youtube_playlist_url("pearl jam no code"))
+        self.assertFalse(self.server.is_youtube_playlist_url(""))
+
     def test_validate_youtube_url_normalizes(self):
         raw = "https://music.youtube.com/watch?v=dQw4w9WgXcQ&si=foo123"
         validated = self.server.validate_youtube_url(raw)
