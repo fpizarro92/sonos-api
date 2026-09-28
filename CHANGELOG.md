@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.2](https://github.com/fpizarro92/sonos-api/compare/v2.4.1...v2.4.2) (2026-09-28)
+
+
+### Bug Fixes
+
+* **stream:** remove invalid yt-dlp --extract-flat option causing 502 Bad Gateway ([1466f2c](https://github.com/fpizarro92/sonos-api/commit/1466f2c9977a70e0abcbb7e401a8f5a02970b524))
+
 ## [2.4.1](https://github.com/fpizarro92/sonos-api/compare/v2.4.0...v2.4.1) (2026-09-28)
 
 
