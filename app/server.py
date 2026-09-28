@@ -187,10 +187,10 @@ def search_youtube_many(query: str, limit: int) -> list[dict[str, str]]:
     return tracks
 
 
-def youtube_json(url: str) -> dict:
+def youtube_json(url: str, timeout: int = 90) -> dict:
     completed = subprocess.run(
         ["yt-dlp", "--flat-playlist", "--dump-single-json", url],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, check=False,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "YouTube Music lookup failed")
@@ -210,9 +210,16 @@ def youtube_watch_url(entry: dict) -> str | None:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def _safe_fetch(fetcher, url: str, timeout: int = 15) -> dict:
+    try:
+        return fetcher(url, timeout=timeout)
+    except TypeError:
+        return fetcher(url)
+
+
 def select_youtube_music_album(query: str, artist: str, fetcher=youtube_json) -> dict:
     if is_youtube_url(query):
-        payload = fetcher(query)
+        payload = _safe_fetch(fetcher, query, timeout=90)
         title = str(payload.get("title") or "Album").strip()
         for prefix in ["Album - ", "Álbum - ", "Sencillo - ", "Single - ", "EP - "]:
             if title.startswith(prefix):
@@ -243,16 +250,50 @@ def select_youtube_music_album(query: str, artist: str, fetcher=youtube_json) ->
     expected_album = normalize_query(query)
     expected_artist = normalize_query(artist)
     search_url = "https://music.youtube.com/search?q=" + quote(f"{artist} {query}".strip())
-    candidates = fetcher(search_url).get("entries") or []
-    best: tuple[int, dict] | None = None
+    try:
+        candidates = _safe_fetch(fetcher, search_url, timeout=30).get("entries") or []
+    except Exception as error:
+        logger.warning("YouTube Music album search failed for '%s': %s", search_url, error)
+        candidates = []
+
+    valid_candidates = []
     for candidate in candidates[:30]:
         if not isinstance(candidate, dict):
             continue
         candidate_url = candidate.get("url")
         parsed = urlparse(candidate_url) if isinstance(candidate_url, str) else None
-        if not parsed or parsed.hostname != "music.youtube.com" or not (parsed.path.startswith("/browse/") or parsed.path.startswith("/playlist")):
+        if not parsed or parsed.hostname != "music.youtube.com":
             continue
-        payload = fetcher(candidate_url)
+
+        # Reject artist / channel URLs explicitly to avoid heavy full-channel extractions
+        if (
+            parsed.path.startswith("/browse/UC")
+            or parsed.path.startswith("/channel/")
+            or parsed.path.startswith("/user/")
+            or parsed.path.startswith("/c/")
+        ):
+            continue
+
+        # Only accept official releases or playlists
+        is_official = parsed.path.startswith("/browse/MPRE") or "list=OLAK5uy_" in parsed.query
+        is_playlist = parsed.path.startswith("/browse/VL") or parsed.path.startswith("/playlist")
+        if not is_official and not is_playlist:
+            continue
+
+        # Priority 0 for official album releases, 1 for playlists
+        valid_candidates.append((0 if is_official else 1, candidate))
+
+    valid_candidates.sort(key=lambda item: item[0])
+
+    best: tuple[int, dict] | None = None
+    for _, candidate in valid_candidates:
+        candidate_url = candidate.get("url")
+        try:
+            payload = _safe_fetch(fetcher, candidate_url, timeout=15)
+        except Exception as error:
+            logger.warning("Failed to fetch YouTube Music album candidate %s: %s", candidate_url, error)
+            continue
+
         title = str(payload.get("title") or "").strip()
         album = title
         for prefix in ["Album - ", "Álbum - ", "Sencillo - ", "Single - ", "EP - "]:
@@ -315,14 +356,31 @@ def select_youtube_music_album(query: str, artist: str, fetcher=youtube_json) ->
         resolved = {"album": album, "artist": artist or tracks[0]["artist"], "tracks": tracks}
         if best is None or score > best[0]:
             best = (score, resolved)
+
     if best is not None:
         return best[1]
+
+    # Fallback to direct YouTube search for album tracks if YouTube Music didn't find an exact album
+    fallback_query = f"{artist} {query}".strip()
+    try:
+        direct_tracks = search_youtube_many(f"{fallback_query} full album", limit=15)
+        if not direct_tracks:
+            direct_tracks = search_youtube_many(fallback_query, limit=15)
+        if direct_tracks:
+            return {
+                "album": query,
+                "artist": artist or direct_tracks[0].get("artist", ""),
+                "tracks": direct_tracks,
+            }
+    except Exception as error:
+        logger.warning("Fallback YouTube album search failed for '%s': %s", fallback_query, error)
+
     raise RuntimeError("No exact YouTube Music album found")
 
 
 def select_youtube_music_artist(artist: str, limit: int = 25, fetcher=youtube_json) -> dict:
     if is_youtube_url(artist):
-        payload = fetcher(artist)
+        payload = _safe_fetch(fetcher, artist, timeout=90)
         title = str(payload.get("title") or "Artist").strip()
         tracks = []
         for entry in payload.get("entries") or []:
@@ -343,7 +401,11 @@ def select_youtube_music_artist(artist: str, limit: int = 25, fetcher=youtube_js
         raise RuntimeError("No tracks found in the provided YouTube artist URL")
 
     search_url = "https://music.youtube.com/search?q=" + quote(f"{artist}".strip())
-    payload = fetcher(search_url)
+    try:
+        payload = _safe_fetch(fetcher, search_url, timeout=30)
+    except Exception as error:
+        logger.warning("YouTube Music artist search failed for '%s': %s", artist, error)
+        payload = {}
     candidates = payload.get("entries") or []
 
     tracks = []
@@ -359,7 +421,11 @@ def select_youtube_music_artist(artist: str, limit: int = 25, fetcher=youtube_js
             continue
 
         if parsed.path.startswith("/browse/") or parsed.path.startswith("/playlist") or parsed.path.startswith("/channel/"):
-            cand_payload = fetcher(c_url)
+            try:
+                cand_payload = _safe_fetch(fetcher, c_url, timeout=15)
+            except Exception as error:
+                logger.warning("Failed to fetch artist candidate %s: %s", c_url, error)
+                continue
             cand_title = str(cand_payload.get("title") or "").strip()
             norm_title = normalize_query(cand_title)
 

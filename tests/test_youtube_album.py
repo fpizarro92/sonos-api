@@ -195,6 +195,136 @@ class YouTubeAlbumResolutionTests(unittest.TestCase):
 
         self.assertEqual(cache.get_album("No Code", "Pearl Jam", now=101), tracks)
 
+    def test_ignores_artist_channel_urls_and_does_not_fetch_them(self):
+        server = load_server()
+        search_url = "https://music.youtube.com/search?q=Balatro%20OST"
+        channel_url = "https://music.youtube.com/browse/UC9ecwl3FTG66jIKA9JRDtmg"
+        channel_url2 = "https://music.youtube.com/channel/UC1234567890abcdef"
+        album_url = "https://music.youtube.com/browse/MPREb_balatro"
+        fetched_urls = []
+
+        payloads = {
+            search_url: {
+                "entries": [
+                    {"url": channel_url},
+                    {"url": channel_url2},
+                    {"url": album_url},
+                ]
+            },
+            album_url: {
+                "title": "Album - Balatro OST",
+                "channel": "LouisF",
+                "entries": [
+                    {"id": "balatro01", "url": "https://music.youtube.com/watch?v=balatro01", "title": "Main Theme", "channel": "LouisF"},
+                    {"id": "balatro02", "url": "https://music.youtube.com/watch?v=balatro02", "title": "Shop Theme", "channel": "LouisF"},
+                ],
+            },
+        }
+
+        def mock_fetcher(url, timeout=15):
+            fetched_urls.append(url)
+            if url in payloads:
+                return payloads[url]
+            raise RuntimeError(f"Unexpected fetch for {url}")
+
+        album = server.select_youtube_music_album("Balatro OST", "", mock_fetcher)
+
+        self.assertNotIn(channel_url, fetched_urls)
+        self.assertNotIn(channel_url2, fetched_urls)
+        self.assertIn(album_url, fetched_urls)
+        self.assertEqual(album["album"], "Balatro OST")
+        self.assertEqual(len(album["tracks"]), 2)
+
+    def test_recovers_when_first_candidate_fails_or_times_out(self):
+        server = load_server()
+        search_url = "https://music.youtube.com/search?q=Test%20Band%20Greatest%20Hits"
+        failing_url = "https://music.youtube.com/browse/MPREb_failing"
+        working_url = "https://music.youtube.com/browse/MPREb_working"
+
+        def mock_fetcher(url, timeout=15):
+            if url == search_url:
+                return {"entries": [{"url": failing_url}, {"url": working_url}]}
+            if url == failing_url:
+                raise TimeoutError("yt-dlp timed out")
+            if url == working_url:
+                return {
+                    "title": "Album - Greatest Hits",
+                    "channel": "Test Band",
+                    "entries": [
+                        {"id": "track01", "url": "https://music.youtube.com/watch?v=track01", "title": "Track 1", "channel": "Test Band"},
+                        {"id": "track02", "url": "https://music.youtube.com/watch?v=track02", "title": "Track 2", "channel": "Test Band"},
+                    ],
+                }
+            raise RuntimeError(f"Unknown URL {url}")
+
+        album = server.select_youtube_music_album("Greatest Hits", "Test Band", mock_fetcher)
+        self.assertEqual(album["album"], "Greatest Hits")
+        self.assertEqual(len(album["tracks"]), 2)
+
+    def test_prioritizes_mpre_official_releases_over_playlists(self):
+        server = load_server()
+        search_url = "https://music.youtube.com/search?q=Artist%20Album"
+        playlist_url = "https://music.youtube.com/browse/VL-playlist"
+        official_url = "https://music.youtube.com/browse/MPREb_official"
+        fetched_order = []
+
+        payloads = {
+            search_url: {
+                "entries": [
+                    {"url": playlist_url},
+                    {"url": official_url},
+                ]
+            },
+            official_url: {
+                "title": "Album - Album",
+                "channel": "Artist",
+                "entries": [
+                    {"id": "offtrack01", "url": "https://music.youtube.com/watch?v=offtrack01", "title": "Track 1", "channel": "Artist"},
+                    {"id": "offtrack02", "url": "https://music.youtube.com/watch?v=offtrack02", "title": "Track 2", "channel": "Artist"},
+                ],
+            },
+            playlist_url: {
+                "title": "Artist - Album",
+                "channel": "Artist",
+                "entries": [
+                    {"id": "playtrack01", "url": "https://music.youtube.com/watch?v=playtrack01", "title": "Track 1", "channel": "Artist"},
+                    {"id": "playtrack02", "url": "https://music.youtube.com/watch?v=playtrack02", "title": "Track 2", "channel": "Artist"},
+                ],
+            },
+        }
+
+        def mock_fetcher(url, timeout=15):
+            fetched_order.append(url)
+            return payloads[url]
+
+        album = server.select_youtube_music_album("Album", "Artist", mock_fetcher)
+        # official_url should be evaluated before playlist_url
+        self.assertEqual(fetched_order[1], official_url)
+        self.assertEqual(album["album"], "Album")
+
+    def test_fallback_to_search_youtube_many_when_no_youtube_music_album_found(self):
+        server = load_server()
+        search_url = "https://music.youtube.com/search?q=Unknown%20Artist%20Rare%20Bootleg"
+
+        def mock_fetcher(url, timeout=15):
+            return {"entries": []}
+
+        original_search_youtube_many = server.search_youtube_many
+        try:
+            server.search_youtube_many = lambda query, limit: [
+                {"url": "https://www.youtube.com/watch?v=fallback1", "title": "Track 1", "artist": "Unknown Artist", "album": ""},
+                {"url": "https://www.youtube.com/watch?v=fallback2", "title": "Track 2", "artist": "Unknown Artist", "album": ""},
+            ]
+            album = server.select_youtube_music_album("Rare Bootleg", "Unknown Artist", mock_fetcher)
+            self.assertEqual(album["album"], "Rare Bootleg")
+            self.assertEqual(album["artist"], "Unknown Artist")
+            self.assertEqual(len(album["tracks"]), 2)
+            self.assertEqual(album["tracks"][0]["url"], "https://www.youtube.com/watch?v=fallback1")
+        finally:
+            server.search_youtube_many = original_search_youtube_many
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
